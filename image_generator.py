@@ -3,6 +3,7 @@
 import base64
 import os
 import random
+import time
 import requests
 from openai import OpenAI
 from config import OPENAI_API_KEY, ROOM_STYLES, IMAGES_DIR
@@ -46,12 +47,21 @@ def generate_interior_image(
         f"No text, no watermarks, no logos."
     )
 
-    # --- 方法1: GPT-4o (gpt-image-1) で生成 ---
-    # 商品画像を参照入力として使える場合
-    if product.get("image_url"):
-        image_result = _generate_with_reference(prompt, product["image_url"])
-    else:
-        image_result = _generate_without_reference(prompt)
+    # --- 方法1: GPT-4o (gpt-image-1) で生成（リトライ付き） ---
+    max_retries = 3
+    image_result = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            if product.get("image_url"):
+                image_result = _generate_with_reference(prompt, product["image_url"])
+            else:
+                image_result = _generate_without_reference(prompt)
+            break  # 成功したらループを抜ける
+        except Exception as e:
+            print(f"   ⚠️ 画像生成リトライ ({attempt}/{max_retries}): {e}")
+            if attempt == max_retries:
+                raise RuntimeError(f"画像生成が{max_retries}回失敗しました: {e}")
+            time.sleep(5 * attempt)  # 段階的に待機
 
     # --- 保存 ---
     os.makedirs(IMAGES_DIR, exist_ok=True)

@@ -1,0 +1,34 @@
+name: Refresh Threads Token
+
+on:
+  schedule:
+    # 毎週日曜 UTC 18:00 (JST 月曜 3:00) にトークン更新
+    - cron: '0 18 * * 0'
+  workflow_dispatch:  # 手動実行も可能
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests python-dotenv
+
+      - name: Refresh Threads access token
+        env:
+          THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+        run: |
+          python -c "
+          from threads_api import ThreadsClient
+          client = ThreadsClient()
+          new_token = client.refresh_long_lived_token()
+          print('New token obtained (update GitHub Secret manually if needed)')
+          print(f'Token prefix: {new_token[:10]}...')
+          "

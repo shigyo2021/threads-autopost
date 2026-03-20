@@ -50,7 +50,7 @@ def run_pipeline(
     category: str | None = None,
     style: str | None = None,
     dry_run: bool = False,
-    upload_method: str = "firebase",
+    upload_method: str = "imgbb",
     upload_kwargs: dict | None = None,
 ):
     """
@@ -189,7 +189,7 @@ def main():
                         help="投稿せずに確認のみ")
     parser.add_argument("--test", action="store_true",
                         help="テスト実行（1件・ドライラン）")
-    parser.add_argument("--upload-method", type=str, default="firebase",
+    parser.add_argument("--upload-method", type=str, default="imgbb",
                         choices=["firebase", "imgbb", "local"],
                         help="画像アップロード方法")
 
