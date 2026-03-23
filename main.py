@@ -13,13 +13,13 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 from datetime import datetime
 
 from config import RAKUTEN_GENRES, ROOM_STYLES, IMAGES_DIR, OUTPUT_DIR, POSTS_LOG
-from rakuten_api import search_products
-from image_generator import generate_interior_image
-from post_generator import generate_post_text, generate_alt_text
+from rakuten_api import search_products, fetch_product_by_url
+from post_generator import generate_post_text, generate_reply_text, generate_alt_text
 from threads_api import ThreadsClient
 from image_uploader import get_uploader
 
@@ -52,14 +52,11 @@ def run_pipeline(
     dry_run: bool = False,
     upload_method: str = "imgbb",
     upload_kwargs: dict | None = None,
+    image_mode: str = "product",
+    urls: list[str] | None = None,
 ):
     """
     パイプライン実行
-
-    1. 楽天APIで商品取得
-    2. AI画像生成
-    3. 投稿文生成
-    4. Threads投稿
 
     Args:
         count: 投稿件数
@@ -68,26 +65,46 @@ def run_pipeline(
         dry_run: True=投稿せず確認のみ
         upload_method: 画像アップロード方法
         upload_kwargs: アップローダーの追加引数
+        image_mode: "product"=商品画像使用, "ai"=AI画像生成
+        urls: 楽天商品URLリスト（指定時はURL直接指定モード）
     """
+    mode_label = "URL指定" if urls else image_mode
     print(f"\n{'='*60}")
     print(f"🏠 Threads×楽天アフィリエイト 自動投稿Bot")
     print(f"   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   件数: {count} | ドライラン: {dry_run}")
+    print(f"   件数: {len(urls) if urls else count} | モード: {mode_label} | ドライラン: {dry_run}")
     print(f"{'='*60}\n")
 
     posted_items = load_posted_items()
 
     # --- Step 1: 商品取得 ---
-    print("📦 Step 1: 楽天APIで商品を検索中...")
-    products = search_products(category=category, count=count * 3)  # 余裕を持って取得
+    if urls:
+        # URL指定モード: 指定されたURLから商品情報を取得
+        print("📦 Step 1: 指定URLから商品情報を取得中...")
+        products = []
+        for url in urls:
+            try:
+                product = fetch_product_by_url(url)
+                if product["item_code"] in posted_items:
+                    print(f"   ⚠️ 投稿済みのためスキップ: {product['name'][:30]}")
+                    continue
+                products.append(product)
+                print(f"   ✅ {product['name'][:40]}")
+            except Exception as e:
+                print(f"   ❌ 取得失敗: {url[:60]}... → {e}")
+    else:
+        # 自動モード: 楽天APIで商品検索
+        print("📦 Step 1: 楽天APIで商品を検索中...")
+        check_img = (image_mode == "product")
+        products = search_products(category=category, count=count * 3, check_images=check_img)
+        products = [p for p in products if p["item_code"] not in posted_items]
 
-    # 投稿済みを除外
-    products = [p for p in products if p["item_code"] not in posted_items]
     if not products:
-        print("⚠️  未投稿の商品が見つかりません。カテゴリを変更してください。")
+        print("⚠️  未投稿の商品が見つかりません。")
         return
 
-    products = products[:count]
+    if not urls:
+        products = products[:count]
     print(f"   → {len(products)}件の商品を選定\n")
 
     # アップローダー準備
@@ -106,21 +123,38 @@ def run_pipeline(
         print(f"スタイル: {room_name}")
         print()
 
-        # --- Step 2: 画像生成 ---
-        print("🎨 Step 2: インテリアイメージを生成中...")
-        try:
-            image_path = generate_interior_image(product, style=chosen_style)
-            print(f"   → 保存: {image_path}\n")
-        except Exception as e:
-            print(f"   ❌ 画像生成エラー: {e}\n")
-            continue
+        # --- Step 2: 画像準備 ---
+        image_paths = []
+        if image_mode == "ai" and not urls:
+            print("🎨 Step 2: AI画像を生成中...")
+            try:
+                from image_generator import generate_interior_image
+                image_path = generate_interior_image(product, style=chosen_style)
+                image_paths = [image_path]
+                print(f"   → 保存: {image_path}\n")
+            except Exception as e:
+                print(f"   ❌ 画像生成エラー: {e}\n")
+                continue
+        else:
+            # 商品画像モード（URL指定時も商品画像を使用）
+            print("🖼️  Step 2: 商品画像を取得・処理中...")
+            try:
+                from image_processor import process_product_images
+                image_paths = process_product_images(product, max_images=3)
+                print(f"   → {len(image_paths)}枚の画像を準備\n")
+            except Exception as e:
+                print(f"   ❌ 商品画像処理エラー: {e}\n")
+                continue
 
         # --- Step 3: 投稿文生成 ---
         print("✍️  Step 3: 投稿文を生成中...")
         try:
             post_text = generate_post_text(product, style=chosen_style)
-            print(f"   --- 投稿文プレビュー ---")
-            print(f"   {post_text[:200]}...")
+            reply_text = generate_reply_text(product)
+            print(f"   --- メイン投稿プレビュー ---")
+            print(f"   {post_text[:200]}")
+            print(f"   --- 返信プレビュー ---")
+            print(f"   {reply_text[:200]}")
             print()
         except Exception as e:
             print(f"   ❌ 投稿文生成エラー: {e}\n")
@@ -131,25 +165,34 @@ def run_pipeline(
             print("🔍 [ドライラン] 投稿をスキップ")
             print(f"\n{'- '*30}")
             print(f"[メイン投稿] {post_text}")
-            print(f"[返信] {product['url']}\npr")
+            print(f"[画像] {len(image_paths)}枚")
+            print(f"[返信] {reply_text}")
             print(f"{'- '*30}\n")
         else:
             print("📤 Step 4: Threadsに投稿中...")
             try:
                 # 画像をアップロード
-                image_url = uploader.upload(image_path)
-                print(f"   画像URL: {image_url}")
+                uploaded_urls = []
+                for img_path in image_paths:
+                    url = uploader.upload(img_path)
+                    uploaded_urls.append(url)
+                    print(f"   画像URL: {url}")
 
-                # メイン投稿（短文 + 画像）
-                result = threads_client.publish_image_post(
-                    text=post_text,
-                    image_url=image_url,
-                )
+                # メイン投稿（複数画像ならカルーセル、1枚なら通常投稿）
+                if len(uploaded_urls) >= 2:
+                    result = threads_client.publish_carousel_post(
+                        text=post_text,
+                        image_urls=uploaded_urls,
+                    )
+                else:
+                    result = threads_client.publish_image_post(
+                        text=post_text,
+                        image_url=uploaded_urls[0],
+                    )
                 post_id = result.get("id", "")
                 print(f"   ✅ メイン投稿完了! ID: {post_id}")
 
-                # 返信（アフィリエイトリンク + pr）
-                reply_text = f"{product['url']}\npr"
+                # 返信（商品補足 + アフィリエイトリンク + pr）
                 reply_result = threads_client.publish_reply(
                     text=reply_text,
                     reply_to_id=post_id,
@@ -166,7 +209,7 @@ def run_pipeline(
             "price": product["price"],
             "url": product["url"],
             "style": chosen_style,
-            "image_path": image_path,
+            "image_paths": image_paths,
             "timestamp": datetime.now().isoformat(),
             "dry_run": dry_run,
         })
@@ -192,6 +235,11 @@ def main():
     parser.add_argument("--upload-method", type=str, default="imgbb",
                         choices=["firebase", "imgbb", "local"],
                         help="画像アップロード方法")
+    parser.add_argument("--image-mode", type=str, default="product",
+                        choices=["product", "ai"],
+                        help="画像モード: product=商品画像, ai=AI生成画像")
+    parser.add_argument("--url", type=str, nargs="+", default=None,
+                        help="楽天商品URL（1つ以上指定）。例: --url https://item.rakuten.co.jp/shop/item/")
 
     args = parser.parse_args()
 
@@ -205,6 +253,8 @@ def main():
         style=args.style,
         dry_run=args.dry_run,
         upload_method=args.upload_method,
+        image_mode=args.image_mode,
+        urls=args.url,
     )
 
 
