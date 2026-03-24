@@ -146,10 +146,60 @@ def run_pipeline(
                 print(f"   ❌ 商品画像処理エラー: {e}\n")
                 continue
 
-        # --- Step 3: 投稿文生成 ---
-        print("✍️  Step 3: 投稿文を生成中...")
+        # --- Step 3: 投稿文生成 + AI採点 + 類似度チェック ---
+        print("✍️  Step 3: 投稿文を生成・品質チェック中...")
         try:
-            post_text = generate_post_text(product, style=chosen_style)
+            from quality_checker import score_post, check_similarity, get_past_good_posts
+
+            past_good = get_past_good_posts(limit=3)
+            max_attempts = 3
+            post_text = None
+            quality_score = 0
+            retry_reason = None
+
+            for attempt in range(1, max_attempts + 1):
+                # 生成（2回目以降はフィードバック付き）
+                candidate = generate_post_text(
+                    product,
+                    style=chosen_style,
+                    past_good_posts=past_good,
+                    retry_reason=retry_reason,
+                )
+                print(f"   [試行{attempt}] {candidate[:80]}...")
+
+                # AI採点
+                score_result = score_post(candidate, product["name"])
+                score = score_result["score"]
+                print(f"   📊 スコア: {score}/7 ({','.join(str(d) for d in score_result['details'])})")
+
+                if not score_result["passed"]:
+                    retry_reason = score_result["reason"]
+                    print(f"   ❌ ボツ: {retry_reason}")
+                    if attempt < max_attempts:
+                        print(f"   🔄 再生成します...")
+                    continue
+
+                # 類似度チェック
+                sim_result = check_similarity(candidate)
+                if not sim_result["is_unique"]:
+                    retry_reason = f"過去投稿と類似度が高い({sim_result['max_similarity']:.0%}): {sim_result['similar_to']}"
+                    print(f"   ❌ 類似: {retry_reason}")
+                    if attempt < max_attempts:
+                        print(f"   🔄 再生成します...")
+                    continue
+
+                # 合格
+                post_text = candidate
+                quality_score = score
+                print(f"   ✅ 合格! スコア {score}/7")
+                break
+
+            if post_text is None:
+                # 最後の候補を使用（警告付き）
+                post_text = candidate
+                quality_score = score
+                print(f"   ⚠️ {max_attempts}回試行しても基準未達。最終候補を使用 (スコア: {score}/7)")
+
             reply_text = generate_reply_text(product)
             print(f"   --- メイン投稿プレビュー ---")
             print(f"   {post_text[:200]}")
@@ -202,7 +252,7 @@ def run_pipeline(
                 print(f"   ❌ 投稿エラー: {e}\n")
                 continue
 
-        # ログ記録
+        # ログ記録（投稿文とスコアも保存 → 次回の生成に活用）
         log_post({
             "item_code": product["item_code"],
             "name": product["name"],
@@ -210,6 +260,8 @@ def run_pipeline(
             "url": product["url"],
             "style": chosen_style,
             "image_paths": image_paths,
+            "post_text": post_text,
+            "quality_score": quality_score,
             "timestamp": datetime.now().isoformat(),
             "dry_run": dry_run,
         })
