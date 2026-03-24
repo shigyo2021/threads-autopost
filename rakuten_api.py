@@ -145,7 +145,9 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
 
     shop_url_name = match.group(1)
     item_path = match.group(2)
-    shop_code = shop_url_name.replace("-", "")
+
+    # shopCode: まずURLそのまま、ダメならハイフン除去で試す
+    shop_code = shop_url_name
 
     # Step 1: 商品ページからタイトルを取得
     page_title = _fetch_page_title(rakuten_url)
@@ -165,12 +167,20 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
 
     items = _search_in_shop(shop_code, keyword)
 
-    # Step 3: キーワードで見つからない場合、キーワードを短くして再検索
+    # Step 3: shopCodeのハイフン有無を切り替えて再試行
+    if not items:
+        alt_shop_code = shop_url_name.replace("-", "") if "-" in shop_url_name else shop_url_name
+        if alt_shop_code != shop_code:
+            items = _search_in_shop(alt_shop_code, keyword)
+            if items:
+                shop_code = alt_shop_code
+
+    # Step 4: キーワードを短くして再検索
     if not items and keyword:
-        short_keyword = " ".join(keyword.split()[:3])  # 最初の3語だけ
+        short_keyword = " ".join(keyword.split()[:3])
         items = _search_in_shop(shop_code, short_keyword)
 
-    # Step 4: それでもダメならshopCode全商品から探す
+    # Step 5: それでもダメならshopCode全商品から探す
     if not items:
         items = _search_in_shop(shop_code, None)
 
@@ -187,13 +197,16 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
             best_item = item
             break
 
-    # 画像URL取得
-    medium_urls = best_item.get("mediumImageUrls", [])
-    all_image_urls = []
-    for img in medium_urls:
-        url = img.get("imageUrl", "")
-        if url:
-            all_image_urls.append(url.replace("?_ex=128x128", "?_ex=500x500"))
+    # 画像URL取得: まずページスクレイピングで全画像を取得
+    all_image_urls = _scrape_product_images(rakuten_url, item_path)
+
+    # スクレイピング失敗時はAPI画像にフォールバック
+    if not all_image_urls:
+        medium_urls = best_item.get("mediumImageUrls", [])
+        for img in medium_urls:
+            url = img.get("imageUrl", "")
+            if url:
+                all_image_urls.append(url.replace("?_ex=128x128", "?_ex=500x500"))
 
     image_url = all_image_urls[0] if all_image_urls else None
 
@@ -209,6 +222,57 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
         "category": "手動選定",
         "item_code": best_item["itemCode"],
     }
+
+
+def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
+    """
+    商品ページHTMLから全画像URLを取得する。
+
+    楽天APIは最大3枚しか画像を返さないが、
+    商品ページには5〜15枚の画像があることが多い。
+    商品コード/パスを含む画像URLをスクレイピングで取得する。
+
+    Returns:
+        画像URLリスト（重複除去・ソート済み）
+    """
+    try:
+        resp = requests.get(
+            page_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        if resp.status_code != 200:
+            return []
+
+        # 商品コード/パスを含む画像URLを抽出
+        all_urls = re.findall(r'https?://[^\"\' >]+', resp.text)
+        img_exts = ('.jpg', '.jpeg', '.png', '.webp')
+        item_imgs = []
+        seen = set()
+
+        for url in all_urls:
+            # 商品コードを含む画像のみ
+            if item_path not in url:
+                continue
+            # 画像拡張子チェック
+            clean = url.split("?")[0].lower()
+            if not any(clean.endswith(ext) for ext in img_exts):
+                continue
+            # クエリパラメータ除去して重複チェック
+            base_url = url.split("?")[0]
+            filename = base_url.split("/")[-1]
+            if base_url in seen or filename in seen:
+                continue
+            seen.add(base_url)
+            seen.add(filename)
+            item_imgs.append(base_url)
+
+        # ファイル名でソート（_01, _02, ... の順になる）
+        item_imgs.sort(key=lambda u: u.split("/")[-1])
+
+        return item_imgs
+    except Exception:
+        return []
 
 
 def _fetch_page_title(url: str) -> str | None:
