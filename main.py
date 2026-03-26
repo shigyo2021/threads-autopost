@@ -10,6 +10,7 @@ if platform.system() == "Windows":
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -266,9 +267,23 @@ def run_pipeline(
             "dry_run": dry_run,
         })
 
+        # 投稿済み画像を削除（imgBBにアップロード済みなので不要）
+        _cleanup_images(image_paths)
+
     print(f"\n{'='*60}")
     print(f"✅ 完了: {len(products)}件処理")
     print(f"{'='*60}\n")
+
+
+def _cleanup_images(image_paths: list[str] | None = None):
+    """投稿済み・不要な画像ファイルを削除"""
+    if image_paths:
+        for path in image_paths:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
 
 def main():

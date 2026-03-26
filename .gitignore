@@ -1,5 +1,8 @@
 .env
 output/
+# キューとログはgit管理する（GitHub Actionsで必要）
+!output/post_queue.json
+!output/posts_log.jsonl
 __pycache__/
 *.pyc
 run_post.bat

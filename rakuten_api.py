@@ -1,5 +1,6 @@
 """楽天商品検索API + アフィリエイトリンク生成"""
 
+import html
 import re
 import random
 import requests
@@ -155,11 +156,17 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
     # Step 2: タイトルからキーワードを抽出してAPI検索
     keyword = None
     if page_title:
+        # HTMLエンティティをデコード（&times; → × 等）
+        keyword = html.unescape(page_title)
         # タイトルから不要部分を除去（【楽天市場】、ショップ名等）
-        keyword = re.sub(r"【[^】]*】", "", page_title)  # 【】内を除去
+        keyword = re.sub(r"【[^】]*】", "", keyword)      # 【】内を除去
         keyword = re.sub(r"\|.*$", "", keyword)            # | 以降を除去
         keyword = re.sub(r"[:：].*$", "", keyword)         # : 以降を除去（ショップ名）
-        keyword = keyword.strip()[:50]  # 長すぎるとヒットしないので制限
+        # サイズ表記等を除去（検索ノイズになる）
+        keyword = re.sub(r"（[^）]*）", "", keyword)       # （）内を除去
+        keyword = re.sub(r"\([^)]*\)", "", keyword)        # ()内を除去
+        keyword = re.sub(r"約[０-９0-9×x\.\s]+[ａ-ｚa-zＡ-Ｚ]*", "", keyword)  # 約36×26×31cm等
+        keyword = keyword.strip()[:40]  # 長すぎるとヒットしないので制限
 
     if not keyword:
         # ページ取得失敗時はURLパスからキーワード生成
@@ -187,15 +194,26 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
     if not items:
         raise ValueError(f"商品が見つかりません: {shop_code}/{item_path}")
 
-    # 最も一致する商品を選択
-    best_item = items[0]["Item"]
+    # 最も一致する商品を選択（item_pathとの照合を優先）
+    best_item = None
     for item_wrapper in items:
         item = item_wrapper["Item"]
-        # itemCodeやitemUrlにitem_pathが含まれていれば完全一致
+        # itemCodeやitemUrlにitem_pathが含まれていれば一致
         item_url = item.get("itemUrl", "")
         if item_path in item.get("itemCode", "") or item_path in item_url:
             best_item = item
             break
+
+    # 一致するものがなければ、キーワード検索結果の1件目を使用
+    # （shopCode全商品フォールバック時は無関係な商品の可能性があるので警告）
+    if best_item is None:
+        if keyword:
+            best_item = items[0]["Item"]
+        else:
+            raise ValueError(
+                f"商品が見つかりません: {shop_code}/{item_path}\n"
+                "ヒント: 商品ページが存在するか確認してください。"
+            )
 
     # 画像URL取得: まずページスクレイピングで全画像を取得
     all_image_urls = _scrape_product_images(rakuten_url, item_path)

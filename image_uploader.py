@@ -64,14 +64,39 @@ class ImgBBUploader:
         self.api_key = api_key
         self.url = "https://api.imgbb.com/1/upload"
 
+    def _compress_image(self, file_path: str, max_size_kb: int = 500) -> bytes:
+        """画像をJPEGに変換・圧縮してbytesを返す"""
+        from PIL import Image
+        import io as _io
+
+        img = Image.open(file_path)
+        if img.mode == "RGBA":
+            # 透明部分を白背景に
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[3])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        # リサイズ（長辺1080px以内）
+        max_dim = 1080
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+
+        # JPEG圧縮
+        buffer = _io.BytesIO()
+        img.save(buffer, format="JPEG", quality=85, optimize=True)
+        print(f"      画像圧縮: {os.path.getsize(file_path)/1024:.0f}KB → {buffer.tell()/1024:.0f}KB")
+        return buffer.getvalue()
+
     def upload(self, file_path: str, **kwargs) -> str:
-        with open(file_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
+        compressed = self._compress_image(file_path)
+        b64 = base64.b64encode(compressed).decode()
 
         resp = requests.post(
             self.url,
             data={"key": self.api_key, "image": b64},
-            timeout=30,
+            timeout=60,
         )
         resp.raise_for_status()
         return resp.json()["data"]["url"]
