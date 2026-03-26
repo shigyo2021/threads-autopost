@@ -9,6 +9,8 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Tokyo
     steps:
       - uses: actions/checkout@v5
 
