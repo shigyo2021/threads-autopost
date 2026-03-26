@@ -118,16 +118,29 @@ def process_queue():
 
         except Exception as e:
             print(f"      ❌ 投稿エラー: {e}")
-            entry["status"] = "error"
-            entry["error"] = str(e)
+            # リトライ回数を管理（3回まで再試行、超えたらエラー確定）
+            retry_count = entry.get("retry_count", 0) + 1
+            entry["retry_count"] = retry_count
+            entry["last_error"] = str(e)
             changed = True
+
+            if retry_count >= 3:
+                entry["status"] = "error"
+                print(f"      ⚠️ 3回失敗のため諦めます")
+            else:
+                # pending のまま残して次回再試行
+                print(f"      🔄 次回再試行します（{retry_count}/3回目）")
 
     # 完了済み・エラーのエントリを削除してキューを整理
     if changed:
-        # pendingのみ残す
+        # pending以外を削除
         cleaned = [e for e in queue if e.get("status") == "pending"]
+        removed = len(queue) - len(cleaned)
         save_queue(cleaned)
-        print(f"\n   キュー整理: {len(queue) - len(cleaned)}件削除、{len(cleaned)}件残り")
+        if removed > 0:
+            print(f"\n   キュー整理: {removed}件削除、{len(cleaned)}件残り")
+        elif cleaned:
+            print(f"\n   キュー: {len(cleaned)}件が次回再試行待ち")
 
     print(f"\n✅ 処理完了: {posted_count}件投稿")
     return posted_count
