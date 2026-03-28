@@ -215,11 +215,18 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
                 "ヒント: 商品ページが存在するか確認してください。"
             )
 
-    # 画像URL取得: まずページスクレイピングで全画像を取得
+    # 画像URL取得: まずページスクレイピングで全画像を取得（リトライ付き）
     all_image_urls = _scrape_product_images(rakuten_url, item_path)
+
+    if not all_image_urls:
+        print("   ⚠️ 画像スクレイピング1回目失敗、リトライ中...")
+        import time
+        time.sleep(2)
+        all_image_urls = _scrape_product_images(rakuten_url, item_path)
 
     # スクレイピング失敗時はAPI画像にフォールバック
     if not all_image_urls:
+        print("   ⚠️ スクレイピング失敗、API画像にフォールバック")
         medium_urls = best_item.get("mediumImageUrls", [])
         for img in medium_urls:
             url = img.get("imageUrl", "")
@@ -244,15 +251,23 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
 
 def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
     """
-    商品ページHTMLから全画像URLを取得する。
+    商品ページHTMLから全商品画像URLを取得する。
 
     楽天APIは最大3枚しか画像を返さないが、
     商品ページには5〜15枚の画像があることが多い。
-    商品コード/パスを含む画像URLをスクレイピングで取得する。
+
+    戦略:
+      1. item_pathを含む画像URLを探す（従来方式）
+      2. 見つからない場合、image.rakuten.co.jp/{shop}/cabinet/ の画像を収集し、
+         共通プレフィックスで最大グループを商品画像と判定する
 
     Returns:
         画像URLリスト（重複除去・ソート済み）
     """
+    # URLからショップ名を抽出
+    shop_match = re.search(r"item\.rakuten\.co\.jp/([^/]+)/", page_url)
+    shop_name = shop_match.group(1) if shop_match else ""
+
     try:
         resp = requests.get(
             page_url,
@@ -262,35 +277,93 @@ def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
         if resp.status_code != 200:
             return []
 
-        # 商品コード/パスを含む画像URLを抽出
         all_urls = re.findall(r'https?://[^\"\' >]+', resp.text)
         img_exts = ('.jpg', '.jpeg', '.png', '.webp')
+
+        # --- 方式1: item_pathを含む画像（従来方式） ---
         item_imgs = []
         seen = set()
 
         for url in all_urls:
-            # 商品コードを含む画像のみ
             if item_path not in url:
                 continue
-            # 画像拡張子チェック
             clean = url.split("?")[0].lower()
             if not any(clean.endswith(ext) for ext in img_exts):
                 continue
-            # クエリパラメータ除去して重複チェック
             base_url = url.split("?")[0]
             filename = base_url.split("/")[-1]
             if base_url in seen or filename in seen:
+                continue
+            # レビュースタンプ・ランキングバッジ等を除外
+            if any(skip in base_url for skip in ("revclip", "rankstamp", "banner", "/bn/")):
                 continue
             seen.add(base_url)
             seen.add(filename)
             item_imgs.append(base_url)
 
-        # ファイル名でソート（_01, _02, ... の順になる）
-        item_imgs.sort(key=lambda u: u.split("/")[-1])
+        if len(item_imgs) >= 3:
+            item_imgs.sort(key=_natural_sort_key)
+            return item_imgs
 
-        return item_imgs
-    except Exception:
+        # --- 方式2: ショップのcabinet画像から共通プレフィックスで判定 ---
+        cabinet_imgs = []
+        seen2 = set()
+        # 除外パターン（バナー、ナビ、アイコン等）
+        skip_patterns = ("banner", "/bn/", "nav", "icon", "logo", "revclip",
+                         "rankstamp", "gold/", "contents/", "shopranking")
+
+        for url in all_urls:
+            # image.rakuten.co.jp/{shop}/cabinet/ の画像のみ
+            if f"/{shop_name}/cabinet/" not in url:
+                continue
+            clean = url.split("?")[0].lower()
+            if not any(clean.endswith(ext) for ext in img_exts):
+                continue
+            base_url = url.split("?")[0]
+            if any(skip in base_url.lower() for skip in skip_patterns):
+                continue
+            filename = base_url.split("/")[-1]
+            if filename in seen2:
+                continue
+            seen2.add(filename)
+            cabinet_imgs.append(base_url)
+
+        if not cabinet_imgs:
+            item_imgs.sort(key=_natural_sort_key)
+            return item_imgs
+
+        # ファイル名のプレフィックス（数字・記号を除いた共通部分）でグループ化
+        prefix_map = {}
+        for url in cabinet_imgs:
+            fname = url.split("/")[-1].split(".")[0]  # 拡張子除去
+            # アンダースコアやハイフンで区切った先頭部分をプレフィックスとする
+            prefix = re.split(r"[_\-]?\d+[a-z]?$", fname)[0]
+            if not prefix:
+                prefix = fname
+            prefix_map.setdefault(prefix, []).append(url)
+
+        # 最大グループを商品画像とみなす
+        best_group = max(prefix_map.values(), key=len)
+
+        # 最大グループが2枚以下なら、全cabinet画像を返す（単一商品ページの場合）
+        if len(best_group) <= 2 and len(cabinet_imgs) > len(best_group):
+            result = cabinet_imgs
+        else:
+            result = best_group
+
+        result.sort(key=_natural_sort_key)
+        return result
+
+    except Exception as e:
+        print(f"   [DEBUG] スクレイピングエラー: {e}")
         return []
+
+
+def _natural_sort_key(url: str):
+    """自然数ソート用キー（_1, _2, ..., _10 が正しい順になる）"""
+    filename = url.split("/")[-1]
+    parts = re.split(r"(\d+)", filename)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
 
 
 def _fetch_page_title(url: str) -> str | None:

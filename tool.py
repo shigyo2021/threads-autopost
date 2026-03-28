@@ -43,18 +43,28 @@ def log_post(entry: dict):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+class UserQuit(Exception):
+    """ユーザーが途中終了を選択した"""
+    pass
+
+
 def ask(prompt: str, default: str = "") -> str:
-    """ユーザー入力を受け取る"""
+    """ユーザー入力を受け取る（qで終了）"""
     if default:
         result = input(f"{prompt} [{default}]: ").strip()
-        return result if result else default
-    return input(f"{prompt}: ").strip()
+    else:
+        result = input(f"{prompt}: ").strip()
+    if result.lower() == "q":
+        raise UserQuit()
+    return result if result else default
 
 
 def ask_yn(prompt: str, default: bool = True) -> bool:
-    """Y/N質問"""
+    """Y/N質問（qで終了）"""
     suffix = " (Y/n)" if default else " (y/N)"
     result = input(f"{prompt}{suffix}: ").strip().lower()
+    if result == "q":
+        raise UserQuit()
     if not result:
         return default
     return result in ("y", "yes", "はい")
@@ -132,24 +142,33 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
     img_choice = ask("   画像番号", "")
 
     selected_indices = None
+    direct_image_urls = None  # 楽天URLを直接使用する場合
     if img_choice:
         try:
             selected_indices = [int(x.strip()) for x in img_choice.split(",") if x.strip().isdigit()]
             if selected_indices:
                 print(f"   → 画像 {', '.join(str(i) for i in selected_indices)} を使用")
+                # 選択した画像の楽天URLを保持（imgBB不要で直接投稿可能）
+                direct_image_urls = []
+                for idx in selected_indices:
+                    if 1 <= idx <= len(image_urls):
+                        direct_image_urls.append(image_urls[idx - 1])
         except ValueError:
             print("   ⚠️ 無効な入力、自動選択を使用します")
             selected_indices = None
 
-    print("\n   画像を処理中...")
-    try:
-        image_paths = process_product_images(
-            product, max_images=3, selected_indices=selected_indices,
-        )
-        print(f"   → {len(image_paths)}枚の画像を準備")
-    except Exception as e:
-        print(f"   ❌ 画像処理エラー: {e}")
-        return
+    # 画像処理（ローカルダウンロード）- imgBBフォールバック用
+    image_paths = None
+    if not direct_image_urls:
+        print("\n   画像を処理中...")
+        try:
+            image_paths = process_product_images(
+                product, max_images=3, selected_indices=selected_indices,
+            )
+            print(f"   → {len(image_paths)}枚の画像を準備")
+        except Exception as e:
+            print(f"   ❌ 画像処理エラー: {e}")
+            return
 
     # --- 投稿文生成 + 品質チェック ---
     print("\n✍️  投稿文を生成中...")
@@ -200,7 +219,8 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
     print(f"{'━'*50}")
     print(f"\n[メイン投稿]")
     print(f"{post_text}")
-    print(f"\n[画像] {len(image_paths)}枚")
+    img_count = len(direct_image_urls) if direct_image_urls else len(image_paths)
+    print(f"\n[画像] {img_count}枚")
     print(f"\n[返信]")
     print(f"{reply_text}")
     print(f"\n{'━'*50}")
@@ -250,25 +270,32 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
     print("   2. 予約投稿（日時指定）")
     timing = ask("   選択", "1")
 
-    # 画像を先にアップロード（予約でも今すぐでも必要）
-    print("\n📤 画像をアップロード中...")
-    try:
-        uploaded_urls = []
-        for img_path in image_paths:
-            img_url = uploader.upload(img_path)
-            uploaded_urls.append(img_url)
-            print(f"   画像: {img_url[:60]}...")
-    except Exception as e:
-        print(f"   ❌ 画像アップロードエラー: {e}")
-        _cleanup_temp_files(image_paths)
-        return
+    # 画像URLを準備
+    if direct_image_urls:
+        # 楽天画像URLを直接使用（imgBB不要）
+        uploaded_urls = direct_image_urls
+        print(f"\n🖼️  楽天画像URLを直接使用（{len(uploaded_urls)}枚）")
+    else:
+        # imgBBにアップロード（自動選択 or フォールバック）
+        print("\n📤 画像をアップロード中...")
+        try:
+            uploaded_urls = []
+            for img_path in image_paths:
+                img_url = uploader.upload(img_path)
+                uploaded_urls.append(img_url)
+                print(f"   画像: {img_url[:60]}...")
+        except Exception as e:
+            print(f"   ❌ 画像アップロードエラー: {e}")
+            _cleanup_temp_files(image_paths)
+            return
 
     if timing == "2":
         # --- 予約投稿 ---
         scheduled_time = _ask_schedule_time()
         if scheduled_time is None:
             print("   ⚠️ 無効な日時です。スキップします。")
-            _cleanup_temp_files(image_paths)
+            if image_paths:
+                _cleanup_temp_files(image_paths)
             return
 
         _add_to_queue({
@@ -316,7 +343,8 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
 
         except Exception as e:
             print(f"   ❌ 投稿エラー: {e}")
-            _cleanup_temp_files(image_paths)
+            if image_paths:
+                _cleanup_temp_files(image_paths)
             return
 
     # ログ記録
@@ -326,7 +354,7 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         "price": product["price"],
         "url": product["url"],
         "style": style,
-        "image_paths": image_paths,
+        "image_urls": uploaded_urls,
         "post_text": post_text,
         "quality_score": quality_score,
         "timestamp": datetime.now().isoformat(),
@@ -337,7 +365,8 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
     print(f"\n   ✅ 完了!")
 
     # 投稿完了後にローカル画像を削除
-    _cleanup_temp_files(image_paths)
+    if image_paths:
+        _cleanup_temp_files(image_paths)
 
 
 QUEUE_FILE = os.path.join(OUTPUT_DIR, "post_queue.json")
@@ -400,8 +429,15 @@ def _save_queue(queue: list[dict]):
 
 
 def _add_to_queue(entry: dict):
-    """予約キューに追加"""
+    """予約キューに追加（同一item_codeの重複を防止）"""
     queue = _load_queue()
+    item_code = entry.get("item_code", "")
+    # すでにpendingで同じ商品がキューにあればスキップ
+    for existing in queue:
+        if existing.get("item_code") == item_code and existing.get("status") == "pending":
+            print(f"   ⚠️ 同じ商品がすでにキューに入っています（上書きします）")
+            queue.remove(existing)
+            break
     queue.append(entry)
     _save_queue(queue)
 
@@ -560,7 +596,7 @@ def main():
     print(f"\n   使い方:")
     print(f"   - 楽天商品URLを貼り付けてEnter")
     print(f"   - 複数URLはスペース区切りで一度に入力可能")
-    print(f"   - 'q' で終了\n")
+    print(f"   - 'q' で終了 / Ctrl+C でいつでも中断可能\n")
 
     uploader = get_uploader("imgbb")
     threads_client = ThreadsClient()
@@ -568,10 +604,6 @@ def main():
 
     while True:
         url_input = ask("\n🔗 楽天URL（qで終了）")
-
-        if url_input.lower() in ("q", "quit", "exit", "終了"):
-            print("\n👋 終了します\n")
-            break
 
         if not url_input:
             continue
@@ -591,4 +623,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (KeyboardInterrupt, UserQuit):
+        print("\n\n👋 終了します\n")

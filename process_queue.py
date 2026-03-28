@@ -37,6 +37,22 @@ def log_post(entry: dict):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def load_posted_items() -> set:
+    """投稿済み商品コードをPOSTS_LOGから読み込む（重複投稿防止）"""
+    posted = set()
+    if os.path.exists(POSTS_LOG):
+        with open(POSTS_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    code = entry.get("item_code", "")
+                    if code:
+                        posted.add(code)
+                except json.JSONDecodeError:
+                    pass
+    return posted
+
+
 def process_queue():
     """投稿時刻が来た予約を処理する"""
     queue = load_queue()
@@ -47,10 +63,21 @@ def process_queue():
     print(f"📅 予約キュー処理: {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"   キュー内: {len(queue)}件\n")
 
+    # 投稿済みアイテムを取得（重複投稿防止）
+    already_posted = load_posted_items()
+
     threads_client = ThreadsClient()
 
     for entry in queue:
         if entry.get("status") != "pending":
+            continue
+
+        # 重複投稿チェック（すでに投稿済みならスキップ）
+        item_code = entry.get("item_code", "")
+        if item_code and item_code in already_posted:
+            print(f"   ⚠️ 投稿済みのためスキップ: {entry.get('name', '')[:40]}")
+            entry["status"] = "skipped_duplicate"
+            changed = True
             continue
 
         scheduled_at = entry.get("scheduled_at", "")
@@ -131,7 +158,7 @@ def process_queue():
                 # pending のまま残して次回再試行
                 print(f"      🔄 次回再試行します（{retry_count}/3回目）")
 
-    # 完了済み・エラーのエントリを削除してキューを整理
+    # 完了済み・エラー・重複スキップのエントリを削除してキューを整理
     if changed:
         # pending以外を削除
         cleaned = [e for e in queue if e.get("status") == "pending"]

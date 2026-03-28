@@ -16,7 +16,9 @@ THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
 
 # --- 出力 ---
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "./output")
+# 絶対パスで固定（どのディレクトリから起動しても同じファイルを参照する）
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", os.path.join(_BASE_DIR, "output"))
 IMAGES_DIR = os.path.join(OUTPUT_DIR, "images")
 POSTS_LOG = os.path.join(OUTPUT_DIR, "posts_log.jsonl")
 
