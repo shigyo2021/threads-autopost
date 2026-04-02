@@ -14,6 +14,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 THREADS_USER_ID = os.getenv("THREADS_USER_ID", "")
 THREADS_ACCESS_TOKEN = os.getenv("THREADS_ACCESS_TOKEN", "")
 IMGBB_API_KEY = os.getenv("IMGBB_API_KEY", "")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
 # --- 出力 ---
 # 絶対パスで固定（どのディレクトリから起動しても同じファイルを参照する）

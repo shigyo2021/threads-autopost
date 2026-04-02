@@ -15,9 +15,9 @@ import os
 import random
 from datetime import datetime
 
-from config import ROOM_STYLES, OUTPUT_DIR, POSTS_LOG, CONTENT_TOPICS
+from config import ROOM_STYLES, OUTPUT_DIR, POSTS_LOG, CONTENT_TOPICS, PEXELS_API_KEY
 from rakuten_api import fetch_product_by_url
-from post_generator import generate_post_text, generate_reply_text, generate_content_text
+from post_generator import generate_post_text, generate_reply_text, generate_content_text, extract_image_keywords
 from quality_checker import score_post, check_similarity, get_past_good_posts
 from image_processor import process_product_images
 from image_uploader import get_uploader
@@ -373,6 +373,78 @@ QUEUE_FILE = os.path.join(OUTPUT_DIR, "post_queue.json")
 CONTENT_LOG = os.path.join(OUTPUT_DIR, "content_log.jsonl")
 
 
+def _search_pexels(query: str, count: int = 9) -> list[dict]:
+    """Pexels APIで画像を検索する"""
+    import requests
+    if not PEXELS_API_KEY:
+        return []
+
+    resp = requests.get(
+        "https://api.pexels.com/v1/search",
+        headers={"Authorization": PEXELS_API_KEY},
+        params={"query": query, "per_page": count, "orientation": "square"},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"   ⚠️ Pexels検索エラー: {resp.status_code}")
+        return []
+
+    results = []
+    for photo in resp.json().get("photos", []):
+        results.append({
+            "id": photo["id"],
+            "url": photo["src"]["large"],        # 投稿用（高画質）
+            "preview": photo["src"]["medium"],    # プレビュー用
+            "photographer": photo["photographer"],
+            "alt": photo.get("alt", ""),
+        })
+    return results
+
+
+def _create_pexels_preview(photos: list[dict], query: str) -> str | None:
+    """Pexels画像のHTMLプレビューを生成してブラウザで開く"""
+    preview_dir = os.path.join(OUTPUT_DIR, "preview")
+    os.makedirs(preview_dir, exist_ok=True)
+    preview_path = os.path.join(preview_dir, "pexels_preview.html")
+
+    try:
+        img_cards = ""
+        for idx, photo in enumerate(photos, 1):
+            img_cards += f"""
+            <div class="card">
+              <div class="number">{idx}</div>
+              <img src="{photo['preview']}" alt="{photo['alt']}" loading="lazy">
+              <div class="credit">📷 {photo['photographer']}</div>
+            </div>"""
+
+        html = f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Pexels画像選択</title>
+<style>
+  body {{ font-family: sans-serif; background: #1a1a1a; color: #fff; padding: 20px; }}
+  h2 {{ text-align: center; }}
+  .hint {{ text-align: center; background: #333; padding: 10px; border-radius: 8px; margin: 15px 0; }}
+  .grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; max-width: 900px; margin: 0 auto; }}
+  .card {{ background: #2a2a2a; border-radius: 8px; overflow: hidden; border: 2px solid transparent; }}
+  .card:hover {{ border-color: #4CAF50; }}
+  .number {{ text-align: center; font-size: 1.5em; font-weight: bold; padding: 8px; }}
+  .card img {{ width: 100%; aspect-ratio: 1; object-fit: cover; }}
+  .credit {{ padding: 5px; text-align: center; font-size: 0.8em; color: #aaa; }}
+  .search {{ text-align: center; color: #888; margin-top: 10px; }}
+</style></head>
+<body>
+  <h2>🖼️ Pexels画像選択</h2>
+  <div class="hint">💡 使いたい画像の<b>番号</b>をターミナルに入力してください（例: 1）</div>
+  <div class="search">検索: "{query}"</div>
+  <div class="grid">{img_cards}</div>
+</body></html>"""
+
+        with open(preview_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        return preview_path
+    except Exception:
+        return None
+
+
 def process_content_post(threads_client):
     """非宣伝コンテンツ投稿（インテリアのコツ・豆知識など）"""
     print(f"\n{'─'*50}")
@@ -431,10 +503,40 @@ def process_content_post(threads_client):
         else:
             continue
 
+    # --- 画像選択（Pexels） ---
+    image_url = None
+    if PEXELS_API_KEY:
+        print("\n🔍 投稿に合う画像を検索中...")
+        keywords = extract_image_keywords(post_text)
+        print(f"   検索キーワード: {keywords}")
+
+        photos = _search_pexels(keywords)
+        if photos:
+            preview_path = _create_pexels_preview(photos, keywords)
+            if preview_path:
+                import webbrowser
+                webbrowser.open(f"file:///{preview_path.replace(os.sep, '/')}")
+                print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
+
+            print(f"\n   使用する画像の番号を入力してください")
+            print(f"   空欄 = 画像なし（テキストのみ投稿）")
+            img_choice = ask("   画像番号", "")
+
+            if img_choice and img_choice.isdigit():
+                idx = int(img_choice)
+                if 1 <= idx <= len(photos):
+                    image_url = photos[idx - 1]["url"]
+                    print(f"   → 画像 {idx} を使用（📷 {photos[idx - 1]['photographer']}）")
+        else:
+            print("   ⚠️ 画像が見つかりませんでした（テキストのみで投稿します）")
+
     # 投稿
     print("\n📤 Threadsに投稿中...")
     try:
-        result = threads_client.publish_text_post(post_text)
+        if image_url:
+            result = threads_client.publish_image_post(post_text, image_url)
+        else:
+            result = threads_client.publish_text_post(post_text)
         post_id = result.get("id", "")
         print(f"   ✅ 投稿完了! ID: {post_id}")
 
@@ -443,6 +545,7 @@ def process_content_post(threads_client):
             "topic": topic_key,
             "post_text": post_text,
             "post_id": post_id,
+            "image_url": image_url,
             "timestamp": datetime.now().isoformat(),
         })
         print(f"\n   ✅ 完了!")

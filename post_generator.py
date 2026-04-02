@@ -138,6 +138,20 @@ def generate_content_text(topic: str, topic_label: str, past_posts: list[str] | 
     return text
 
 
+def extract_image_keywords(post_text: str) -> str:
+    """投稿文から画像検索用の英語キーワードを抽出する"""
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=50,
+        messages=[{"role": "user", "content": f"""以下の日本語投稿文に合うストックフォトを検索するための英語キーワードを1〜3語で出力してください。
+インテリア・部屋の写真が見つかるようなキーワードにしてください。
+キーワードのみ出力。説明不要。
+
+投稿文: {post_text}"""}],
+    )
+    return response.content[0].text.strip()
+
+
 def generate_alt_text(product: dict, style: str) -> str:
     """画像のaltテキスト（アクセシビリティ用）を生成"""
     room = ROOM_STYLES.get(style, ROOM_STYLES["scandinavian"])
