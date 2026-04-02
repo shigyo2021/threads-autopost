@@ -504,32 +504,75 @@ def process_content_post(threads_client):
         else:
             continue
 
-    # --- 画像選択（Pexels） ---
+    # --- 画像選択 ---
     image_url = None
-    if PEXELS_API_KEY:
-        print("\n🔍 投稿に合う画像を検索中...")
-        keywords = extract_image_keywords(post_text)
-        print(f"   検索キーワード: {keywords}")
+    while True:
+        if PEXELS_API_KEY:
+            print("\n🔍 投稿に合う画像を検索中...")
+            keywords = extract_image_keywords(post_text)
+            print(f"   検索キーワード: {keywords}")
 
-        photos = _search_pexels(keywords)
-        if photos:
-            preview_path = _create_pexels_preview(photos, keywords)
-            if preview_path:
-                import webbrowser
-                webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
-                print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
+            photos = _search_pexels(keywords)
+            if photos:
+                preview_path = _create_pexels_preview(photos, keywords)
+                if preview_path:
+                    import webbrowser
+                    webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
+                    print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
+            else:
+                photos = []
+                print("   ⚠️ Pexelsで画像が見つかりませんでした")
 
-            print(f"\n   使用する画像の番号を入力してください")
-            print(f"   空欄 = 画像なし（テキストのみ投稿）")
-            img_choice = ask("   画像番号", "")
+        print(f"\n   画像の選択:")
+        print(f"   番号  = Pexels画像を使用（例: 3）")
+        print(f"   s     = 別のキーワードで再検索")
+        print(f"   f     = ローカルファイルの画像URLを指定")
+        print(f"   空欄  = 画像なし（テキストのみ投稿）")
+        print(f"   x     = 投稿を中止")
+        img_choice = ask("   選択", "")
 
-            if img_choice and img_choice.isdigit():
-                idx = int(img_choice)
-                if 1 <= idx <= len(photos):
-                    image_url = photos[idx - 1]["url"]
-                    print(f"   → 画像 {idx} を使用（📷 {photos[idx - 1]['photographer']}）")
+        if img_choice == "x":
+            print("   ⏭️ 投稿を中止しました")
+            return
+        elif img_choice == "s":
+            # 手動キーワードで再検索
+            new_kw = ask("   検索キーワード（英語推奨）")
+            if new_kw:
+                keywords = new_kw
+                photos = _search_pexels(keywords)
+                if photos:
+                    preview_path = _create_pexels_preview(photos, keywords)
+                    if preview_path:
+                        import webbrowser
+                        webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
+                        print(f"   → {len(photos)}枚見つかりました")
+                else:
+                    print("   ⚠️ 見つかりませんでした")
+                continue
+        elif img_choice == "f":
+            # ローカル画像URL or ファイルパスを指定
+            print("   画像URLを入力してください")
+            print("   （https:// で始まるURL）")
+            manual_url = ask("   URL")
+            if manual_url and manual_url.startswith("http"):
+                image_url = manual_url
+                print(f"   → 手動指定画像を使用")
+            else:
+                print("   ⚠️ 無効なURLです")
+                continue
+            break
+        elif img_choice and img_choice.isdigit() and photos:
+            idx = int(img_choice)
+            if 1 <= idx <= len(photos):
+                image_url = photos[idx - 1]["url"]
+                print(f"   → 画像 {idx} を使用（📷 {photos[idx - 1]['photographer']}）")
+                break
+            else:
+                print(f"   ⚠️ 1〜{len(photos)}の番号を入力してください")
+                continue
         else:
-            print("   ⚠️ 画像が見つかりませんでした（テキストのみで投稿します）")
+            # 空欄 = テキストのみ
+            break
 
     # 投稿
     print("\n📤 Threadsに投稿中...")
