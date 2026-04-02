@@ -445,23 +445,28 @@ def _add_to_queue(entry: dict):
 def _push_queue():
     """予約キューファイルをgit commit & pushする"""
     import subprocess
+    cwd = os.path.dirname(os.path.abspath(__file__))
     try:
-        # post_queue.jsonをステージング
+        # post_queue.json と posts_log.jsonl をステージング（-f: .gitignore除外対策）
         subprocess.run(
-            ["git", "add", QUEUE_FILE],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True,
+            ["git", "add", "-f", QUEUE_FILE, POSTS_LOG],
+            cwd=cwd, capture_output=True,
         )
+        # 変更がある場合のみcommit
+        result = subprocess.run(
+            ["git", "diff", "--staged", "--quiet"],
+            cwd=cwd, capture_output=True,
+        )
+        if result.returncode == 0:
+            print("   ℹ️ キューに変更なし（pushスキップ）")
+            return
         subprocess.run(
             ["git", "commit", "-m", "Add scheduled post to queue"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True,
+            cwd=cwd, capture_output=True,
         )
         result = subprocess.run(
             ["git", "push"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True,
-            text=True,
+            cwd=cwd, capture_output=True, text=True,
         )
         if result.returncode == 0:
             print("   ✅ キューをGitHubにpushしました")
