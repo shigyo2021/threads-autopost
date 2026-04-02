@@ -12,6 +12,7 @@ if platform.system() == "Windows":
 import glob
 import json
 import os
+import pathlib
 import random
 from datetime import datetime
 
@@ -129,7 +130,7 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         preview_path = _create_image_preview(product, image_urls)
         if preview_path:
             import webbrowser
-            webbrowser.open(f"file:///{preview_path.replace(os.sep, '/')}")
+            webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
             print(f"   → ブラウザでプレビューを開きました")
         else:
             # フォールバック: ファイル名一覧
@@ -515,7 +516,7 @@ def process_content_post(threads_client):
             preview_path = _create_pexels_preview(photos, keywords)
             if preview_path:
                 import webbrowser
-                webbrowser.open(f"file:///{preview_path.replace(os.sep, '/')}")
+                webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
                 print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
 
             print(f"\n   使用する画像の番号を入力してください")
