@@ -5,6 +5,7 @@ from config import (
     ANTHROPIC_API_KEY,
     POST_GENERATION_SYSTEM_PROMPT,
     REPLY_GENERATION_SYSTEM_PROMPT,
+    CONTENT_GENERATION_SYSTEM_PROMPT,
     ROOM_STYLES,
 )
 
@@ -101,6 +102,39 @@ def generate_reply_text(product: dict) -> str:
     if not text.strip().endswith("pr"):
         text = text.strip() + "\npr"
 
+    return text
+
+
+def generate_content_text(topic: str, topic_label: str, past_posts: list[str] | None = None) -> str:
+    """
+    非宣伝コンテンツ投稿文を生成（インテリアのコツ・豆知識など）。
+
+    Args:
+        topic: トピックキー
+        topic_label: トピック表示名
+        past_posts: 過去のコンテンツ投稿（重複回避用）
+
+    Returns:
+        投稿文テキスト
+    """
+    user_prompt = f"以下のテーマでThreads投稿文を作成してください。\n\n【テーマ】{topic_label}"
+
+    if past_posts:
+        user_prompt += "\n\n【過去の投稿（内容が被らないようにしてください）】"
+        for i, post in enumerate(past_posts[-5:], 1):
+            body = post.split("\n#")[0].strip()
+            user_prompt += f"\n{i}. 「{body}」"
+
+    user_prompt += "\n\n投稿文のみを出力してください。前置きや説明は不要です。"
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=500,
+        system=CONTENT_GENERATION_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_prompt}],
+    )
+
+    text = response.content[0].text.strip()
     return text
 
 

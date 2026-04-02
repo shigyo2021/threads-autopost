@@ -15,9 +15,9 @@ import os
 import random
 from datetime import datetime
 
-from config import ROOM_STYLES, OUTPUT_DIR, POSTS_LOG
+from config import ROOM_STYLES, OUTPUT_DIR, POSTS_LOG, CONTENT_TOPICS
 from rakuten_api import fetch_product_by_url
-from post_generator import generate_post_text, generate_reply_text
+from post_generator import generate_post_text, generate_reply_text, generate_content_text
 from quality_checker import score_post, check_similarity, get_past_good_posts
 from image_processor import process_product_images
 from image_uploader import get_uploader
@@ -370,6 +370,106 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
 
 
 QUEUE_FILE = os.path.join(OUTPUT_DIR, "post_queue.json")
+CONTENT_LOG = os.path.join(OUTPUT_DIR, "content_log.jsonl")
+
+
+def process_content_post(threads_client):
+    """非宣伝コンテンツ投稿（インテリアのコツ・豆知識など）"""
+    print(f"\n{'─'*50}")
+    print("📝 コンテンツ投稿（リンクなし）")
+    print(f"{'─'*50}")
+
+    # トピック選択
+    topics = list(CONTENT_TOPICS.items())
+    print("\n   テーマ一覧:")
+    for i, (key, label) in enumerate(topics, 1):
+        print(f"   {i}. {label}")
+    print(f"   0. ランダム")
+
+    choice = ask("   番号を選択", "0")
+    if choice == "0" or not choice.isdigit() or int(choice) > len(topics):
+        topic_key, topic_label = random.choice(topics)
+    else:
+        topic_key, topic_label = topics[int(choice) - 1]
+    print(f"   → テーマ: {topic_label}")
+
+    # 過去のコンテンツ投稿を取得（重複回避用）
+    past_content = _load_past_content()
+
+    # 投稿文生成
+    print("\n✍️  投稿文を生成中...")
+    post_text = generate_content_text(topic_key, topic_label, past_content)
+
+    # プレビュー＆編集
+    while True:
+        print(f"\n{'━'*50}")
+        print(f"{post_text}")
+        print(f"{'━'*50}")
+
+        print("\n   1. このまま投稿する")
+        print("   2. 再生成する")
+        print("   3. 手動で編集する")
+        print("   4. スキップ（投稿しない）")
+
+        edit_choice = ask("   選択", "1")
+
+        if edit_choice == "1":
+            break
+        elif edit_choice == "2":
+            print("\n   🔄 再生成中...")
+            post_text = generate_content_text(topic_key, topic_label, past_content)
+        elif edit_choice == "3":
+            print(f"\n   現在の投稿文:")
+            print(f"   {post_text}")
+            new_text = input("\n   新しい投稿文を入力（空欄でキャンセル）:\n   ").strip()
+            if new_text:
+                post_text = new_text
+                print("   ✅ 更新しました")
+        elif edit_choice == "4":
+            print("   ⏭️ スキップ")
+            return
+        else:
+            continue
+
+    # 投稿
+    print("\n📤 Threadsに投稿中...")
+    try:
+        result = threads_client.publish_text_post(post_text)
+        post_id = result.get("id", "")
+        print(f"   ✅ 投稿完了! ID: {post_id}")
+
+        # ログ記録
+        _log_content({
+            "topic": topic_key,
+            "post_text": post_text,
+            "post_id": post_id,
+            "timestamp": datetime.now().isoformat(),
+        })
+        print(f"\n   ✅ 完了!")
+
+    except Exception as e:
+        print(f"   ❌ 投稿エラー: {e}")
+
+
+def _load_past_content() -> list[str]:
+    """過去のコンテンツ投稿文を読み込む"""
+    posts = []
+    if os.path.exists(CONTENT_LOG):
+        with open(CONTENT_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    posts.append(entry.get("post_text", ""))
+                except json.JSONDecodeError:
+                    pass
+    return posts
+
+
+def _log_content(entry: dict):
+    """コンテンツ投稿ログを記録"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(CONTENT_LOG, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def _ask_schedule_time() -> str | None:
@@ -595,20 +695,27 @@ def main():
         return
 
     print(f"\n{'='*50}")
-    print(f"🏠 Threads手動投稿ツール")
-    print(f"   楽天URLを貼るだけで投稿できます")
+    print(f"🏠 Threads投稿ツール")
     print(f"{'='*50}")
-    print(f"\n   使い方:")
-    print(f"   - 楽天商品URLを貼り付けてEnter")
-    print(f"   - 複数URLはスペース区切りで一度に入力可能")
-    print(f"   - 'q' で終了 / Ctrl+C でいつでも中断可能\n")
+    print(f"\n   qで終了 / Ctrl+Cでいつでも中断可能\n")
 
     uploader = get_uploader("imgbb")
     threads_client = ThreadsClient()
     posted_items = load_posted_items()
 
     while True:
-        url_input = ask("\n🔗 楽天URL（qで終了）")
+        print("\n   ┌─────────────────────────┐")
+        print("   │ 1. 商品投稿（楽天URL）   │")
+        print("   │ 2. コンテンツ投稿（リンクなし）│")
+        print("   └─────────────────────────┘")
+        mode = ask("   選択", "1")
+
+        if mode == "2":
+            process_content_post(threads_client)
+            continue
+
+        # --- 商品投稿モード ---
+        url_input = ask("\n🔗 楽天URL")
 
         if not url_input:
             continue
@@ -623,7 +730,6 @@ def main():
 
         for url in urls:
             process_one_product(url, uploader, threads_client, posted_items)
-            # 投稿済みリストを更新
             posted_items = load_posted_items()
 
 
