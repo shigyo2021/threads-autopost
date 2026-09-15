@@ -93,9 +93,26 @@ def process_queue() -> int:
     return posted
 
 
+def check_token() -> bool:
+    """GitHubに登録したトークンが使えるかだけを確認する（投稿しない。結果の文言にトークンは含めない）"""
+    from threads_api import ThreadsClient
+
+    ok, message = ThreadsClient(
+        user_id=os.environ.get("THREADS_USER_ID", ""),
+        access_token=os.environ.get("THREADS_ACCESS_TOKEN", ""),
+    ).check_token()
+    if ok:
+        print("✅ Threadsトークン: 有効（投稿できます）")
+    else:
+        print(f"❌ Threadsトークン: 使えません → {qs.redact(message)[:200]}")
+    return ok
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    if "--check" in sys.argv:
+    if "--check-token" in sys.argv:
+        sys.exit(0 if check_token() else 1)
+    elif "--check" in sys.argv:
         due = count_due()
         print(f"時間が来た予約: {due}件")
         output = os.environ.get("GITHUB_OUTPUT")

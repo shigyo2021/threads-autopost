@@ -5,6 +5,11 @@ on:
     # 15分ごと。混雑する毎時0分・30分は避ける（GitHubの定時実行は数分〜数十分遅れることがある）
     - cron: '4,19,34,49 * * * *'
   workflow_dispatch:
+    inputs:
+      check_token:
+        description: '投稿せずに、登録したThreadsトークンが使えるかだけ確認する'
+        type: boolean
+        default: false
 
 # リポジトリへの書き込み（キューの状態更新）以外の権限は与えない
 permissions:
@@ -21,6 +26,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
+
+      # 手動実行で check_token にチェックを入れたときだけ。投稿はしない
+      - name: Set up Python for token check
+        if: github.event_name == 'workflow_dispatch' && inputs.check_token
+        uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Check Threads token (manual only)
+        if: github.event_name == 'workflow_dispatch' && inputs.check_token
+        env:
+          THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+        run: |
+          pip install --quiet requests python-dotenv
+          python process_queue.py --check-token
 
       # 標準ライブラリだけで判定する（ライブラリのインストールもシークレットの受け渡しもしない）
       - name: Check due posts
