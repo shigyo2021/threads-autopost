@@ -52,9 +52,10 @@ def process_queue() -> int:
             continue
 
         scheduled = datetime.fromisoformat(entry["scheduled_at"])
-        if now - scheduled > qs.MAX_DELAY:
+        deadline = qs.post_deadline(scheduled)
+        if now > deadline:
             entry["status"] = qs.STATUS_EXPIRED
-            entry["last_error"] = f"予定時刻（{scheduled:%m/%d %H:%M}）から3時間以上遅れたため投稿しなかった"
+            entry["last_error"] = f"予定（{scheduled:%m/%d %H:%M}）のあと {deadline:%m/%d %H:%M} までに実行されなかったため投稿しなかった"
             qs.save_entry(path, entry)
             print(f"   ⏭️ 期限切れ: {_label(entry)}")
             continue

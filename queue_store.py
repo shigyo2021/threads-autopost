@@ -23,8 +23,10 @@ STATUS_POSTED = "posted"
 STATUS_ERROR = "error"
 STATUS_EXPIRED = "expired"
 
-# 予定時刻からこれ以上遅れたら投稿しない（GitHub Actions が長時間止まっていたときに深夜に出ないように）
-MAX_DELAY = timedelta(hours=3)
+# GitHub の定時実行は数時間遅れることがあるので、予定日の22時までは遅れても投稿する。
+# それを過ぎたら深夜に出ないよう取りやめる（21時以降の予約は、予定時刻から1時間までは待つ）
+LATEST_POST_HOUR = 22
+MIN_GRACE = timedelta(hours=1)
 
 _SECRET_ENV_NAMES = (
     "THREADS_ACCESS_TOKEN", "THREADS_APP_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
@@ -83,6 +85,12 @@ def save_entry(path: str, entry: dict):
     os.makedirs(QUEUE_DIR, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(text + "\n")
+
+
+def post_deadline(scheduled: datetime) -> datetime:
+    """この時刻を過ぎたら投稿しない"""
+    same_day_limit = scheduled.replace(hour=LATEST_POST_HOUR, minute=0, second=0, microsecond=0)
+    return max(same_day_limit, scheduled + MIN_GRACE)
 
 
 def is_due(entry: dict, now: datetime | None = None) -> bool:

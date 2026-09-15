@@ -4,6 +4,7 @@
     py token_tool.py set       コピーしたThreadsトークンを確認して .env に保存
     py token_tool.py exchange  コピーしたトークンを60日トークンに交換して保存（交換不要ならそのまま保存）
     py token_tool.py refresh   有効な長期トークンの期限を60日延長して保存
+    py token_tool.py copy      GitHubのSecretsに貼るため、トークンをクリップボードにコピー（画面には出さない）
 """
 
 import os
@@ -45,8 +46,7 @@ def _save_token(token: str):
         "THREADS_TOKEN_SAVED_AT": date.today().isoformat(),
     })
     print(f"✅ .env に保存しました（{date.today().isoformat()}）")
-    print("   ⚠️ 予約投稿を使うなら、GitHubのSecrets「THREADS_ACCESS_TOKEN」も同じトークンに差し替えてください")
-    print("      （リポジトリの Settings → Secrets and variables → Actions）")
+    print("   ⚠️ 予約投稿を使うなら、GitHubのSecrets「THREADS_ACCESS_TOKEN」も差し替えてください → py token_tool.py copy")
 
 
 def token_age_days() -> int | None:
@@ -195,7 +195,22 @@ def cmd_refresh():
     _save_token(new_token)
 
 
-COMMANDS = {"check": cmd_check, "set": cmd_set, "exchange": cmd_exchange, "refresh": cmd_refresh}
+def cmd_copy():
+    """GitHubのSecretsに貼るため、.env のトークンをクリップボードにコピーする（画面には出さない）"""
+    from dotenv import dotenv_values
+
+    token = dotenv_values(ENV_PATH).get("THREADS_ACCESS_TOKEN", "")
+    if not token:
+        print("❌ .env にトークンがありません")
+        return
+    subprocess.run(["clip"], input=token.encode("utf-16-le"), check=True)
+    print(f"✅ Threadsのトークンをクリップボードにコピーしました（{len(token)}文字）")
+    print("   GitHubのリポジトリ → Settings → Secrets and variables → Actions → THREADS_ACCESS_TOKEN の")
+    print("   鉛筆アイコン（Update）を開いて貼り付け → Update secret")
+    print("   ⚠️ 貼り付けたら、ほかの場所に貼らないよう、別の文字をコピーしてクリップボードを上書きしてください")
+
+
+COMMANDS = {"check": cmd_check, "set": cmd_set, "exchange": cmd_exchange, "refresh": cmd_refresh, "copy": cmd_copy}
 
 if __name__ == "__main__":
     if platform.system() == "Windows":
