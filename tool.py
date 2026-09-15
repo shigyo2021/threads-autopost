@@ -14,15 +14,26 @@ import json
 import os
 import pathlib
 import random
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 from config import ROOM_STYLES, OUTPUT_DIR, POSTS_LOG, CONTENT_TOPICS, PEXELS_API_KEY
-from rakuten_api import fetch_product_by_url
-from post_generator import generate_post_text, generate_reply_text, generate_content_text, extract_image_keywords
-from quality_checker import score_post, check_similarity, get_past_good_posts
+from rakuten_api import fetch_product_by_url, normalize_rakuten_url, affiliate_link_sns
+from post_generator import (
+    generate_post_text, generate_reply_text, generate_content_text,
+    extract_image_keywords, finalize_reply_text,
+)
+from quality_checker import score_post, check_similarity, get_past_good_posts, lint_post
+from drafts import (
+    load_draft as load_cc_draft, is_ready as cc_draft_ready, mark_draft_used,
+    load_stock, format_stock_line, post_url, posts_today, posted_dates, print_stock_summary,
+    MAX_POSTS_PER_DAY,
+)
+import queue_sync
 from image_processor import process_product_images
 from image_uploader import get_uploader
 from threads_api import ThreadsClient
+from token_tool import token_age_days, REFRESH_WARNING_DAYS
+from sheet import export_sheet_quietly
 
 
 def load_posted_items() -> set:
@@ -96,6 +107,130 @@ def select_style() -> str:
     return key
 
 
+def ask_multiline(prompt: str) -> str:
+    """複数行の入力を受け取る（「.」だけの行で確定、空のまま「.」でキャンセル）"""
+    print(f"\n   {prompt}（複数行OK。入力を終えたら「.」だけの行でEnter）:")
+    lines = []
+    while True:
+        line = input("   ")
+        if line.strip() == ".":
+            break
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _select_text_source(product: dict, url: str) -> tuple[str | None, dict | None]:
+    """
+    投稿文の作り方を選ぶ。
+
+    Returns:
+        ("api", None) / ("claude_code", 下書きdict) / (None, None)=スキップ
+    """
+    draft = load_cc_draft(product["item_code"])
+    ready = cc_draft_ready(draft)
+
+    print("\n✍️  投稿文の作り方:")
+    if ready:
+        first_line = draft["post_text"].strip().splitlines()[0]
+        print(f"   💬 Claude Codeの下書きがあります:「{first_line[:40]}」")
+    print("   1. Claude APIで生成する（APIクレジットを使う）")
+    print("   2. Claude Codeの下書きを使う（APIクレジットを使わない）")
+    choice = ask("   選択", "2" if ready else "1")
+
+    if choice != "2":
+        return "api", None
+
+    while not ready:
+        print("\n   ⚠️ この商品の下書きがまだありません。Claude Codeにこう依頼してください:")
+        print(f"   「この商品の投稿文を作って {url}」")
+        print("   Enter = 下書きを読み込み直す / a = APIで生成する / s = スキップ")
+        answer = ask("   選択", "").lower()
+        if answer == "a":
+            return "api", None
+        if answer == "s":
+            return None, None
+        draft = load_cc_draft(product["item_code"])
+        ready = cc_draft_ready(draft)
+
+    return "claude_code", draft
+
+
+def _generate_post_with_api(product: dict, style: str, past_good: list[str]) -> tuple[str, int]:
+    """Claude APIで投稿文を生成し、採点・類似度チェックで最大3回作り直す"""
+    print("\n✍️  投稿文を生成中...")
+    max_attempts = 3
+    retry_reason = None
+
+    for attempt in range(1, max_attempts + 1):
+        candidate = generate_post_text(
+            product,
+            style=style,
+            past_good_posts=past_good,
+            retry_reason=retry_reason,
+        )
+
+        score_result = score_post(candidate, product["name"])
+        score = score_result["score"]
+        print(f"\n   [候補{attempt}] スコア {score}/7")
+        print(f"   {candidate}")
+
+        if not score_result["passed"]:
+            retry_reason = score_result["reason"]
+            print(f"   ⚠️ ボツ: {retry_reason}")
+            continue
+
+        if check_similarity(candidate)["is_unique"]:
+            return candidate, score
+
+        retry_reason = "過去投稿と類似"
+        print("   ⚠️ 類似度が高いため再生成")
+
+    print("\n   ⚠️ 基準未達ですが最終候補を使用")
+    return candidate, score
+
+
+def _apply_cc_draft(product: dict, draft: dict) -> tuple[str, str, int | None]:
+    """Claude Codeの下書きから投稿文と返信文を作る（APIは使わない）"""
+    post_text = draft["post_text"].strip()
+    reply_source = draft.get("reply_text", "").strip() or \
+        f"レビュー★{product['review_average']}（{product['review_count']}件）。\n[LINK]"
+    reply_text = finalize_reply_text(reply_source, product["url"])
+
+    for warning in lint_post(post_text):
+        print(f"   ⚠️ {warning}")
+    sim = check_similarity(post_text)
+    if not sim["is_unique"]:
+        print(f"   ⚠️ 過去投稿と似ています（類似度{sim['max_similarity']}）: {sim['similar_to']}")
+
+    return post_text, reply_text, draft.get("self_score")
+
+
+def _print_post_preview(post_text: str, reply_text: str, img_count: int, text_source: str):
+    source_label = "Claude API" if text_source == "api" else "Claude Code下書き"
+    print(f"\n{'━'*50}")
+    print(f"📝 投稿プレビュー（文章: {source_label}）")
+    print(f"{'━'*50}")
+    print(f"\n[メイン投稿]")
+    print(post_text)
+    print(f"\n[画像] {img_count}枚")
+    print(f"\n[返信]")
+    print(reply_text)
+    print(f"\n{'━'*50}")
+
+
+def _threads_reply_link(product: dict, url: str) -> str | None:
+    """
+    返信に使うThreads用リンク。下書きに付いていればそれ、
+    貼り付けたURL自体がThreads用リンクならそれ。なければ None（APIのリンクを使う）。
+    """
+    draft = load_cc_draft(product["item_code"])
+    if draft and draft.get("reply_link"):
+        return draft["reply_link"]
+    if affiliate_link_sns(url) == "Threads":
+        return url
+    return None
+
+
 def process_one_product(url: str, uploader, threads_client, posted_items: set):
     """1商品を処理"""
     print(f"\n{'─'*50}")
@@ -119,8 +254,15 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
     print(f"   レビュー: ★{product['review_average']}（{product['review_count']}件）")
     print(f"   画像数: {len(product['image_urls'])}枚")
 
-    # --- スタイル選択 ---
-    style = select_style()
+    # --- 返信に付けるリンク ---
+    # 以降の product["url"]（返信文・ログ・予約）は、Threads用リンクがあればそれになる
+    reply_link = _threads_reply_link(product, url)
+    if reply_link:
+        product = {**product, "url": reply_link}
+        print(f"   🔗 返信のリンク: Threads用リンク（SNS別レポートに載る）")
+    else:
+        print(f"   🔗 返信のリンク: 通常のアフィリエイトリンク（SNS別レポートには載らない）")
+    item_url = normalize_rakuten_url(url).split("?")[0]
 
     # --- 画像選択（ブラウザプレビュー付き） ---
     image_urls = product.get("image_urls", [])
@@ -171,93 +313,81 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
             print(f"   ❌ 画像処理エラー: {e}")
             return
 
-    # --- 投稿文生成 + 品質チェック ---
-    print("\n✍️  投稿文を生成中...")
+    # --- 投稿文の用意（Claude API or Claude Code下書き） ---
+    text_source, draft = _select_text_source(product, url)
+    if text_source is None:
+        print("   ⏭️ スキップ")
+        _cleanup_temp_files(image_paths)
+        return
+
+    style = select_style() if text_source == "api" else draft.get("style", "")
     past_good = get_past_good_posts(limit=3)
-    max_attempts = 3
-    post_text = None
-    quality_score = 0
-    retry_reason = None
 
-    for attempt in range(1, max_attempts + 1):
-        candidate = generate_post_text(
-            product,
-            style=style,
-            past_good_posts=past_good,
-            retry_reason=retry_reason,
-        )
-
-        score_result = score_post(candidate, product["name"])
-        score = score_result["score"]
-        print(f"\n   [候補{attempt}] スコア {score}/7")
-        print(f"   {candidate}")
-
-        if score_result["passed"]:
-            sim = check_similarity(candidate)
-            if sim["is_unique"]:
-                post_text = candidate
-                quality_score = score
-                break
-            else:
-                retry_reason = f"過去投稿と類似"
-                print(f"   ⚠️ 類似度が高いため再生成")
-                continue
+    try:
+        if text_source == "api":
+            post_text, quality_score = _generate_post_with_api(product, style, past_good)
+            reply_text = generate_reply_text(product)
         else:
-            retry_reason = score_result["reason"]
-            print(f"   ⚠️ ボツ: {retry_reason}")
-            continue
-
-    if post_text is None:
-        post_text = candidate
-        quality_score = score
-        print(f"\n   ⚠️ 基準未達ですが最終候補を使用")
+            post_text, reply_text, quality_score = _apply_cc_draft(product, draft)
+    except Exception as e:
+        print(f"   ❌ 投稿文の用意に失敗: {e}")
+        if text_source == "api":
+            print("   → Claude Codeの下書きモード（2）なら APIを使わずに続けられます")
+        _cleanup_temp_files(image_paths)
+        return
 
     # --- 確認 ---
-    reply_text = generate_reply_text(product)
-
-    print(f"\n{'━'*50}")
-    print(f"📝 投稿プレビュー")
-    print(f"{'━'*50}")
-    print(f"\n[メイン投稿]")
-    print(f"{post_text}")
     img_count = len(direct_image_urls) if direct_image_urls else len(image_paths)
-    print(f"\n[画像] {img_count}枚")
-    print(f"\n[返信]")
-    print(f"{reply_text}")
-    print(f"\n{'━'*50}")
 
     # 編集オプション
     while True:
+        _print_post_preview(post_text, reply_text, img_count, text_source)
+
         print("\n   1. このまま投稿する")
-        print("   2. 投稿文を再生成する")
+        if text_source == "api":
+            print("   2. 投稿文を再生成する（API）")
+        else:
+            print("   2. 下書きを読み込み直す（Claude Codeで書き直した後）")
         print("   3. 投稿文を手動で編集する")
         print("   4. スキップ（投稿しない）")
+        if text_source == "claude_code":
+            print("   5. Claude APIで生成し直す")
 
         choice = ask("   選択", "1")
 
         if choice == "1":
             break
-        elif choice == "2":
+        elif choice == "2" and text_source == "api":
             print("\n   🔄 再生成中...")
-            retry_reason = "ユーザーが再生成を要求"
             post_text = generate_post_text(
                 product, style=style,
                 past_good_posts=past_good,
-                retry_reason=retry_reason,
+                retry_reason="ユーザーが再生成を要求",
             )
-            score_result = score_post(post_text, product["name"])
-            quality_score = score_result["score"]
+            quality_score = score_post(post_text, product["name"])["score"]
             print(f"\n   [新候補] スコア {quality_score}/7")
-            print(f"   {post_text}")
             reply_text = generate_reply_text(product)
-            print(f"\n   [返信] {reply_text[:100]}")
+        elif choice == "2":
+            reloaded = load_cc_draft(product["item_code"])
+            if cc_draft_ready(reloaded):
+                draft = reloaded
+                post_text, reply_text, quality_score = _apply_cc_draft(product, draft)
+            else:
+                print("   ⚠️ 下書きが見つかりません")
+        elif choice == "5" and text_source == "claude_code":
+            text_source = "api"
+            style = select_style()
+            post_text, quality_score = _generate_post_with_api(product, style, past_good)
+            reply_text = generate_reply_text(product)
         elif choice == "3":
             print("\n   現在の投稿文:")
             print(f"   {post_text}")
-            new_text = input("\n   新しい投稿文を入力（空欄でキャンセル）:\n   ").strip()
+            new_text = ask_multiline("新しい投稿文を入力")
             if new_text:
                 post_text = new_text
                 print("   ✅ 更新しました")
+                for warning in lint_post(post_text):
+                    print(f"   ⚠️ {warning}")
         elif choice == "4":
             print("   ⏭️ スキップ")
             _cleanup_temp_files(image_paths)
@@ -266,10 +396,12 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
             continue
 
     # --- 今すぐ投稿 or 予約 ---
+    planned_at = _planned_datetime(product["item_code"])
     print("\n   📅 投稿タイミング:")
     print("   1. 今すぐ投稿する")
-    print("   2. 予約投稿（日時指定）")
-    timing = ask("   選択", "1")
+    print("   2. 予約投稿（GitHub Actionsが指定の時間に投稿）")
+    # 予定が先の日時なら予約を初期値にする（前日に準備する使い方）
+    timing = ask("   選択", "2" if planned_at and planned_at > datetime.now() else "1")
 
     # 画像URLを準備
     if direct_image_urls:
@@ -291,35 +423,44 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
             return
 
     if timing == "2":
-        # --- 予約投稿 ---
-        scheduled_time = _ask_schedule_time()
+        # --- 予約投稿（投稿ログにはまだ記録しない。投稿後に sync_results で取り込む） ---
+        scheduled_time = _ask_schedule_time(planned_at)
         if scheduled_time is None:
-            print("   ⚠️ 無効な日時です。スキップします。")
-            if image_paths:
-                _cleanup_temp_files(image_paths)
+            print("   ⚠️ 予約をやめました")
+            _cleanup_temp_files(image_paths)
             return
 
-        _add_to_queue({
+        day = scheduled_time[:10]
+        booked = queue_sync.count_on_date(day) + posted_dates()[day]
+        if booked >= MAX_POSTS_PER_DAY:
+            print(f"   ⚠️ {day} はすでに{booked}件の投稿・予約があります（目安は1日{MAX_POSTS_PER_DAY}件まで）")
+            if not ask_yn("   それでも予約しますか？", False):
+                _cleanup_temp_files(image_paths)
+                return
+
+        print("\n📤 GitHubに予約を送信中...")
+        draft_for_label = load_cc_draft(product["item_code"]) or {}
+        ok = queue_sync.schedule({
             "item_code": product["item_code"],
+            "label": draft_for_label.get("label", ""),
             "name": product["name"],
             "price": product["price"],
-            "affiliate_url": product["url"],
+            "url": product["url"],
+            "item_url": item_url,
             "post_text": post_text,
             "reply_text": reply_text,
             "image_urls": uploaded_urls,
             "style": style,
             "quality_score": quality_score,
+            "text_source": text_source,
             "scheduled_at": scheduled_time,
-            "created_at": datetime.now().isoformat(),
-            "status": "pending",
         })
-
-        print(f"\n   📅 予約完了! {scheduled_time} に投稿されます")
-        print(f"   → GitHub Actionsが自動で投稿します")
-        print(f"   → 予約一覧: py tool.py --queue")
-
-        # git push して GitHub Actions からアクセス可能にする
-        _push_queue()
+        _cleanup_temp_files(image_paths)
+        if ok:
+            print(f"\n   ✅ 予約しました: {scheduled_time[:16].replace('T', ' ')} ごろにGitHub Actionsが投稿します")
+            print("   （混雑すると数分〜数十分遅れることがあります。予約一覧・取り消し: py tool.py --queue）")
+            export_sheet_quietly()
+        return
     else:
         # --- 今すぐ投稿 ---
         print("\n📤 Threadsに投稿中...")
@@ -354,14 +495,20 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         "name": product["name"],
         "price": product["price"],
         "url": product["url"],
+        "item_url": item_url,
         "style": style,
         "image_urls": uploaded_urls,
         "post_text": post_text,
         "quality_score": quality_score,
+        "text_source": text_source,
         "timestamp": datetime.now().isoformat(),
         "dry_run": False,
-        "scheduled": timing == "2",
+        "scheduled": False,
     })
+
+    if text_source == "claude_code":
+        mark_draft_used(product["item_code"])
+    export_sheet_quietly()
 
     print(f"\n   ✅ 完了!")
 
@@ -370,8 +517,88 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         _cleanup_temp_files(image_paths)
 
 
-QUEUE_FILE = os.path.join(OUTPUT_DIR, "post_queue.json")
 CONTENT_LOG = os.path.join(OUTPUT_DIR, "content_log.jsonl")
+DRAFTS_FILE = os.path.join(OUTPUT_DIR, "content_drafts.json")
+
+
+def _load_drafts() -> list[dict]:
+    """下書き一覧を読み込む"""
+    if os.path.exists(DRAFTS_FILE):
+        with open(DRAFTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def _save_drafts(drafts: list[dict]):
+    """下書き一覧を保存"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(DRAFTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(drafts, f, ensure_ascii=False, indent=2)
+
+
+def _add_draft(post_text: str, topic_key: str, image_keywords: str | None = None):
+    """下書きに保存"""
+    drafts = _load_drafts()
+    drafts.append({
+        "post_text": post_text,
+        "topic": topic_key,
+        "image_keywords": image_keywords,
+        "created_at": datetime.now().isoformat(),
+    })
+    _save_drafts(drafts)
+
+
+def _pick_draft() -> dict | None:
+    """下書きを選択して返す（選択された下書きはリストから削除）"""
+    drafts = _load_drafts()
+    if not drafts:
+        return None
+
+    print(f"\n   📋 未投稿の下書きが {len(drafts)}件 あります:")
+    for i, d in enumerate(drafts, 1):
+        text_preview = d["post_text"].split("\n")[0][:50]
+        source = "Claude Code" if d.get("source") == "claude_code" else "保存済み"
+        print(f"   {i}. [{d.get('created_at', '')[:10]} {source}] {text_preview}...")
+
+    print(f"\n   番号 = 下書きを使用（APIクレジットを使わない） / n = Claude APIで新規生成")
+    choice = ask("   選択", "1")
+
+    if choice and choice.isdigit():
+        idx = int(choice)
+        if 1 <= idx <= len(drafts):
+            selected = drafts.pop(idx - 1)
+            _save_drafts(drafts)
+            return selected
+    return None
+
+
+def _choose_content_topic() -> tuple[str, str]:
+    topics = list(CONTENT_TOPICS.items())
+    print("\n   テーマ一覧:")
+    for i, (key, label) in enumerate(topics, 1):
+        print(f"   {i}. {label}")
+    print(f"   0. ランダム")
+
+    choice = ask("   番号を選択", "0")
+    if choice == "0" or not choice.isdigit() or not 1 <= int(choice) <= len(topics):
+        topic_key, topic_label = random.choice(topics)
+    else:
+        topic_key, topic_label = topics[int(choice) - 1]
+    print(f"   → テーマ: {topic_label}")
+    return topic_key, topic_label
+
+
+def _search_and_preview_pexels(keywords: str) -> list[dict]:
+    photos = _search_pexels(keywords)
+    if not photos:
+        print("   ⚠️ Pexelsで画像が見つかりませんでした")
+        return []
+    preview_path = _create_pexels_preview(photos, keywords)
+    if preview_path:
+        import webbrowser
+        webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
+        print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
+    return photos
 
 
 def _search_pexels(query: str, count: int = 9) -> list[dict]:
@@ -452,26 +679,22 @@ def process_content_post(threads_client):
     print("📝 コンテンツ投稿（リンクなし）")
     print(f"{'─'*50}")
 
-    # トピック選択
-    topics = list(CONTENT_TOPICS.items())
-    print("\n   テーマ一覧:")
-    for i, (key, label) in enumerate(topics, 1):
-        print(f"   {i}. {label}")
-    print(f"   0. ランダム")
-
-    choice = ask("   番号を選択", "0")
-    if choice == "0" or not choice.isdigit() or int(choice) > len(topics):
-        topic_key, topic_label = random.choice(topics)
-    else:
-        topic_key, topic_label = topics[int(choice) - 1]
-    print(f"   → テーマ: {topic_label}")
-
-    # 過去のコンテンツ投稿を取得（重複回避用）
     past_content = _load_past_content()
+    topic_label = None
+    image_keywords = None
 
-    # 投稿文生成
-    print("\n✍️  投稿文を生成中...")
-    post_text = generate_content_text(topic_key, topic_label, past_content)
+    # 下書きがあれば先に提示（Claude Codeの下書きならAPIを使わない）
+    draft = _pick_draft()
+    if draft:
+        post_text = draft["post_text"]
+        topic_key = draft.get("topic") or "draft"
+        image_keywords = draft.get("image_keywords")
+        for warning in lint_post(post_text, max_length=150):
+            print(f"   ⚠️ {warning}")
+    else:
+        topic_key, topic_label = _choose_content_topic()
+        print("\n✍️  投稿文を生成中...")
+        post_text = generate_content_text(topic_key, topic_label, past_content)
 
     # プレビュー＆編集
     while True:
@@ -480,7 +703,7 @@ def process_content_post(threads_client):
         print(f"{'━'*50}")
 
         print("\n   1. このまま投稿する")
-        print("   2. 再生成する")
+        print("   2. Claude APIで生成し直す" if topic_label is None else "   2. 再生成する（API）")
         print("   3. 手動で編集する")
         print("   4. スキップ（投稿しない）")
 
@@ -489,96 +712,153 @@ def process_content_post(threads_client):
         if edit_choice == "1":
             break
         elif edit_choice == "2":
-            print("\n   🔄 再生成中...")
+            if topic_label is None:
+                if draft:
+                    _add_draft(post_text, topic_key, image_keywords)  # 元の下書きは残す
+                    print("   （元の下書きは残しました）")
+                topic_key, topic_label = _choose_content_topic()
+                image_keywords = None
+            print("\n   🔄 生成中...")
             post_text = generate_content_text(topic_key, topic_label, past_content)
+            draft = None
         elif edit_choice == "3":
             print(f"\n   現在の投稿文:")
             print(f"   {post_text}")
-            new_text = input("\n   新しい投稿文を入力（空欄でキャンセル）:\n   ").strip()
+            new_text = ask_multiline("新しい投稿文を入力")
             if new_text:
                 post_text = new_text
                 print("   ✅ 更新しました")
         elif edit_choice == "4":
-            print("   ⏭️ スキップ")
+            _add_draft(post_text, topic_key, image_keywords)
+            print("   ⏭️ スキップ（下書きに保存しました）")
             return
         else:
             continue
 
     # --- 画像選択 ---
-    image_url = None
-    while True:
-        if PEXELS_API_KEY:
-            print("\n🔍 投稿に合う画像を検索中...")
-            keywords = extract_image_keywords(post_text)
-            print(f"   検索キーワード: {keywords}")
+    image_urls = []
+    photos = []
+    if PEXELS_API_KEY:
+        print("\n🔍 投稿に合う画像を検索中...")
+        # 下書きにキーワードがあればAPIを使わない
+        keywords = image_keywords or extract_image_keywords(post_text)
+        print(f"   検索キーワード: {keywords}")
+        photos = _search_and_preview_pexels(keywords)
 
-            photos = _search_pexels(keywords)
-            if photos:
-                preview_path = _create_pexels_preview(photos, keywords)
-                if preview_path:
-                    import webbrowser
-                    webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
-                    print(f"   → ブラウザでプレビューを開きました（{len(photos)}枚）")
-            else:
-                photos = []
-                print("   ⚠️ Pexelsで画像が見つかりませんでした")
+    while True:
+        if image_urls:
+            print(f"\n   現在の選択済み画像: {len(image_urls)}枚")
 
         print(f"\n   画像の選択:")
-        print(f"   番号  = Pexels画像を使用（例: 3）")
+        print(f"   番号  = Pexels画像を使用（例: 3 / 複数: 1,3,5）")
         print(f"   s     = 別のキーワードで再検索")
-        print(f"   f     = ローカルファイルの画像URLを指定")
-        print(f"   空欄  = 画像なし（テキストのみ投稿）")
+        print(f"   f     = ローカルファイル（PC内の画像・複数可）")
+        print(f"   空欄  = 選択終了{'（テキストのみ投稿）' if not image_urls else ''}")
         print(f"   x     = 投稿を中止")
         img_choice = ask("   選択", "")
 
         if img_choice == "x":
-            print("   ⏭️ 投稿を中止しました")
+            _add_draft(post_text, topic_key, image_keywords)
+            print("   ⏭️ 投稿を中止しました（下書きに保存しました）")
             return
         elif img_choice == "s":
             # 手動キーワードで再検索
             new_kw = ask("   検索キーワード（英語推奨）")
             if new_kw:
-                keywords = new_kw
-                photos = _search_pexels(keywords)
-                if photos:
-                    preview_path = _create_pexels_preview(photos, keywords)
-                    if preview_path:
-                        import webbrowser
-                        webbrowser.open(pathlib.Path(os.path.abspath(preview_path)).as_uri())
-                        print(f"   → {len(photos)}枚見つかりました")
-                else:
-                    print("   ⚠️ 見つかりませんでした")
-                continue
+                photos = _search_and_preview_pexels(new_kw)
+            continue
         elif img_choice == "f":
-            # ローカル画像URL or ファイルパスを指定
-            print("   画像URLを入力してください")
-            print("   （https:// で始まるURL）")
-            manual_url = ask("   URL")
-            if manual_url and manual_url.startswith("http"):
-                image_url = manual_url
-                print(f"   → 手動指定画像を使用")
-            else:
-                print("   ⚠️ 無効なURLです")
+            # フォルダ指定 → 画像一覧から番号選択
+            print("   画像が入っているフォルダのパスを入力してください")
+            print("   例: C:\\Users\\（ユーザー名）\\Pictures")
+            folder_path = ask("   フォルダパス").strip().strip('"')
+            if not folder_path or not os.path.isdir(folder_path):
+                print("   ⚠️ フォルダが見つかりません")
                 continue
-            break
-        elif img_choice and img_choice.isdigit() and photos:
-            idx = int(img_choice)
-            if 1 <= idx <= len(photos):
-                image_url = photos[idx - 1]["url"]
-                print(f"   → 画像 {idx} を使用（📷 {photos[idx - 1]['photographer']}）")
-                break
-            else:
-                print(f"   ⚠️ 1〜{len(photos)}の番号を入力してください")
+
+            # フォルダ内の画像ファイル一覧
+            img_exts = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+            files = sorted([
+                f for f in os.listdir(folder_path)
+                if f.lower().endswith(img_exts)
+            ])
+            if not files:
+                print("   ⚠️ 画像ファイルが見つかりません")
                 continue
+
+            print(f"\n   📂 {os.path.basename(folder_path)} 内の画像（{len(files)}枚）:")
+            for i, fname in enumerate(files, 1):
+                size_kb = os.path.getsize(os.path.join(folder_path, fname)) // 1024
+                print(f"   {i:>3}. {fname}  ({size_kb}KB)")
+
+            print(f"\n   番号を入力（複数: 1,3,5 / 範囲: 1-4 / 全選択: all）")
+            sel = ask("   選択", "").strip()
+            if not sel:
+                continue
+
+            # 選択番号のパース
+            selected_indices = set()
+            if sel.lower() == "all":
+                selected_indices = set(range(1, len(files) + 1))
+            else:
+                for part in sel.split(","):
+                    part = part.strip()
+                    if "-" in part:
+                        bounds = part.split("-", 1)
+                        if bounds[0].isdigit() and bounds[1].isdigit():
+                            start, end = int(bounds[0]), int(bounds[1])
+                            for n in range(start, end + 1):
+                                if 1 <= n <= len(files):
+                                    selected_indices.add(n)
+                    elif part.isdigit():
+                        n = int(part)
+                        if 1 <= n <= len(files):
+                            selected_indices.add(n)
+
+            if not selected_indices:
+                print("   ⚠️ 有効な番号がありません")
+                continue
+
+            # アップロード
+            uploader = get_uploader("imgbb")
+            for idx in sorted(selected_indices):
+                fp = os.path.join(folder_path, files[idx - 1])
+                print(f"   📤 アップロード中... {files[idx - 1]}")
+                try:
+                    url = uploader.upload(fp)
+                    image_urls.append(url)
+                    print(f"   ✅ [{len(image_urls)}枚目] OK")
+                except Exception as e:
+                    print(f"   ❌ 失敗: {e}")
+
+            if image_urls:
+                print(f"\n   📸 合計 {len(image_urls)}枚 の画像を選択済み")
+            continue
+        elif img_choice and photos:
+            # 番号指定（カンマ区切りで複数対応: 1,3,5）
+            nums = [n.strip() for n in img_choice.split(",")]
+            for n in nums:
+                if n.isdigit():
+                    idx = int(n)
+                    if 1 <= idx <= len(photos):
+                        image_urls.append(photos[idx - 1]["url"])
+                        print(f"   → 画像 {idx} を追加（📷 {photos[idx - 1]['photographer']}）")
+                    else:
+                        print(f"   ⚠️ 1〜{len(photos)}の番号を入力してください")
+            if image_urls:
+                print(f"\n   📸 合計 {len(image_urls)}枚 の画像を選択済み")
+            continue
         else:
-            # 空欄 = テキストのみ
+            # 空欄 = 選択終了
             break
 
     # 投稿
     print("\n📤 Threadsに投稿中...")
     try:
-        if image_url:
-            result = threads_client.publish_image_post(post_text, image_url)
+        if len(image_urls) >= 2:
+            result = threads_client.publish_carousel_post(post_text, image_urls)
+        elif len(image_urls) == 1:
+            result = threads_client.publish_image_post(post_text, image_urls[0])
         else:
             result = threads_client.publish_text_post(post_text)
         post_id = result.get("id", "")
@@ -589,13 +869,15 @@ def process_content_post(threads_client):
             "topic": topic_key,
             "post_text": post_text,
             "post_id": post_id,
-            "image_url": image_url,
+            "image_urls": image_urls if image_urls else None,
             "timestamp": datetime.now().isoformat(),
         })
         print(f"\n   ✅ 完了!")
 
     except Exception as e:
         print(f"   ❌ 投稿エラー: {e}")
+        _add_draft(post_text, topic_key, image_keywords)
+        print("   （投稿文は下書きに戻しました）")
 
 
 def _load_past_content() -> list[str]:
@@ -619,132 +901,83 @@ def _log_content(entry: dict):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def _ask_schedule_time() -> str | None:
-    """予約日時を対話的に取得する"""
-    print("\n   📅 予約日時を入力してください（JST）")
-    print("   形式: YYYY-MM-DD HH:MM")
-    print("   例:   2026-03-27 08:00")
-    print("   ショートカット:")
-    print("     '8'  → 明日 08:00")
-    print("     '12' → 明日 12:00")
-    print("     '20' → 明日 20:00")
+def _planned_datetime(item_code: str) -> datetime | None:
+    """ストックの下書きに入っている投稿予定日時"""
+    draft = load_cc_draft(item_code)
+    if not draft or not draft.get("planned_date"):
+        return None
+    return datetime.fromisoformat(f"{draft['planned_date']}T{draft.get('planned_time') or '12:30'}")
 
-    time_input = ask("   日時", "").strip()
 
+def _ask_schedule_time(default: datetime | None = None) -> str | None:
+    """予約日時を対話的に取得する（日本時間）。Enterでストックの予定日時"""
+    now = datetime.now()
+    print("\n   📅 予約日時（日本時間）")
+    print("   形式: YYYY-MM-DD HH:MM　例: 2026-09-16 12:30")
+    print("   '12' と入力 → 明日 12:30　／　'18' と入力 → 明日 18:30")
+
+    default_text = default.strftime("%Y-%m-%d %H:%M") if default and default > now else ""
+    time_input = ask("   日時", default_text).strip()
     if not time_input:
         return None
 
-    from datetime import timedelta
-
-    now = datetime.now()
-
-    # ショートカット: 数字だけ → 明日のその時刻
-    if time_input.isdigit() and len(time_input) <= 2:
-        hour = int(time_input)
-        if 0 <= hour <= 23:
-            tomorrow = now + timedelta(days=1)
-            scheduled = tomorrow.replace(hour=hour, minute=0, second=0, microsecond=0)
-            print(f"   → {scheduled.strftime('%Y-%m-%d %H:%M')} に予約")
-            return scheduled.isoformat()
-
-    # フル日時入力
-    try:
-        scheduled = datetime.strptime(time_input, "%Y-%m-%d %H:%M")
-        if scheduled <= now:
-            print("   ⚠️ 過去の日時です。未来の日時を指定してください。")
+    if time_input in ("12", "18"):
+        tomorrow = now.date() + timedelta(days=1)
+        scheduled = datetime.fromisoformat(f"{tomorrow}T{time_input}:30")
+    else:
+        try:
+            scheduled = datetime.strptime(time_input, "%Y-%m-%d %H:%M")
+        except ValueError:
+            print("   ⚠️ 日時は YYYY-MM-DD HH:MM で入力してください")
             return None
-        print(f"   → {scheduled.strftime('%Y-%m-%d %H:%M')} に予約")
-        return scheduled.isoformat()
-    except ValueError:
-        print("   ⚠️ 日時の形式が不正です。YYYY-MM-DD HH:MM で入力してください。")
+
+    if scheduled <= now + timedelta(minutes=5):
+        print("   ⚠️ 5分以上先の日時を指定してください（すぐ出すなら「1. 今すぐ投稿する」）")
         return None
+    print(f"   → {scheduled:%Y-%m-%d %H:%M} に予約")
+    return scheduled.isoformat()
 
 
-def _load_queue() -> list[dict]:
-    """予約キューを読み込む"""
-    if os.path.exists(QUEUE_FILE):
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
-
-
-def _save_queue(queue: list[dict]):
-    """予約キューを保存"""
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(queue, f, ensure_ascii=False, indent=2)
-
-
-def _add_to_queue(entry: dict):
-    """予約キューに追加（同一item_codeの重複を防止）"""
-    queue = _load_queue()
-    item_code = entry.get("item_code", "")
-    # すでにpendingで同じ商品がキューにあればスキップ
-    for existing in queue:
-        if existing.get("item_code") == item_code and existing.get("status") == "pending":
-            print(f"   ⚠️ 同じ商品がすでにキューに入っています（上書きします）")
-            queue.remove(existing)
-            break
-    queue.append(entry)
-    _save_queue(queue)
-
-
-def _push_queue():
-    """予約キューファイルをgit commit & pushする"""
-    import subprocess
-    cwd = os.path.dirname(os.path.abspath(__file__))
-    try:
-        # post_queue.json と posts_log.jsonl をステージング（-f: .gitignore除外対策）
-        subprocess.run(
-            ["git", "add", "-f", QUEUE_FILE, POSTS_LOG],
-            cwd=cwd, capture_output=True,
-        )
-        # 変更がある場合のみcommit
-        result = subprocess.run(
-            ["git", "diff", "--staged", "--quiet"],
-            cwd=cwd, capture_output=True,
-        )
-        if result.returncode == 0:
-            print("   ℹ️ キューに変更なし（pushスキップ）")
-            return
-        subprocess.run(
-            ["git", "commit", "-m", "Add scheduled post to queue"],
-            cwd=cwd, capture_output=True,
-        )
-        result = subprocess.run(
-            ["git", "push"],
-            cwd=cwd, capture_output=True, text=True,
-        )
-        if result.returncode == 0:
-            print("   ✅ キューをGitHubにpushしました")
-        else:
-            print(f"   ⚠️ push失敗: {result.stderr[:100]}")
-            print("   → 手動で git push してください")
-    except Exception as e:
-        print(f"   ⚠️ git操作エラー: {e}")
-        print("   → 手動で git push してください")
+def _print_sync_summary(summary: dict):
+    for line in summary["posted"]:
+        print(f"   ✅ 予約投稿済み: {line}")
+    for line in summary["partial"]:
+        print(f"   ⚠️ 本文は投稿済みだが、リンクの返信が付けられなかった: {line}")
+        print("      → Threadsアプリでその投稿に返信し、リンクと「pr」を手で付けてください（管理表の返信文をコピー）")
+    for line in summary["failed"]:
+        print(f"   ❌ 予約投稿できなかった（ストックに戻しました）: {line}")
+    if summary["failed"]:
+        print("   → トークン切れなら、GitHubのSecrets「THREADS_ACCESS_TOKEN」を新しいトークンに差し替えてください")
 
 
 def show_queue():
-    """予約キューの一覧を表示"""
-    queue = _load_queue()
-    pending = [q for q in queue if q.get("status") == "pending"]
+    """予約一覧を表示し、番号を選ぶと取り消せる"""
+    print("\n   GitHubから最新の状態を取得中...")
+    _print_sync_summary(queue_sync.sync_results())
 
-    if not pending:
-        print("\n   📭 予約投稿はありません\n")
-        return
+    while True:
+        pending = queue_sync.pending_entries()
+        if not pending:
+            print("\n   📭 予約投稿はありません\n")
+            return
 
-    print(f"\n   📅 予約投稿一覧 ({len(pending)}件)")
-    print(f"   {'─'*45}")
-    for i, entry in enumerate(pending, 1):
-        scheduled = entry.get("scheduled_at", "?")
-        name = entry.get("name", "?")[:35]
-        text_preview = entry.get("post_text", "")[:40]
-        images = len(entry.get("image_urls", []))
-        print(f"   {i}. [{scheduled[:16]}] {name}")
-        print(f"      {text_preview}...")
-        print(f"      画像{images}枚")
-        print()
+        print(f"\n   📅 予約投稿一覧（{len(pending)}件）")
+        for i, (_, entry) in enumerate(pending, 1):
+            when = entry["scheduled_at"][:16].replace("T", " ")
+            label = entry.get("label") or entry.get("name", "")[:24]
+            print(f"   {i}. {when}  {label}  （画像{len(entry.get('image_urls', []))}枚）")
+
+        choice = ask("\n   取り消す番号（空欄で終了）", "")
+        if not choice:
+            return
+        if not choice.isdigit() or not 1 <= int(choice) <= len(pending):
+            print("   ⚠️ 番号が正しくありません")
+            continue
+        path, entry = pending[int(choice) - 1]
+        if ask_yn(f"   「{entry.get('label') or entry.get('name', '')[:24]}」の予約を取り消しますか？", False):
+            if queue_sync.cancel(path):
+                print("   ✅ 取り消しました（下書きはストックに戻ります）")
+                export_sheet_quietly()
 
 
 def _cleanup_temp_files(image_paths: list[str] | None = None):
@@ -835,6 +1068,45 @@ def _create_image_preview(product: dict, image_urls: list[str]) -> str | None:
         return None
 
 
+def _pick_from_stock() -> str | None:
+    """作成済みストックから1件選び、その商品URLを返す"""
+    stock = [d for d in load_stock() if cc_draft_ready(d)]
+    if not stock:
+        print("   ⚠️ 作成済みのストックがありません")
+        print("   → Claude Codeに「この商品の投稿文を作って <URL>」と依頼してください")
+        return None
+
+    today = date.today().isoformat()
+    print("\n   📦 ストック（上から投稿順）:")
+    for i, draft in enumerate(stock, 1):
+        print(f"   {i}. {format_stock_line(draft, today)}")
+
+    choice = ask("   番号を選択", "1")
+    if not choice.isdigit() or not 1 <= int(choice) <= len(stock):
+        print("   ⚠️ 番号が正しくありません")
+        return None
+
+    draft = stock[int(choice) - 1]
+    if draft.get("queued_at"):
+        print(f"   ⚠️ この商品は予約済みです（{draft['queued_at'][:16].replace('T', ' ')}）")
+        if not ask_yn("   予約を置き換えて進めますか？", False):
+            return None
+    planned = draft.get("planned_date")
+    if planned and planned > today:
+        print(f"   ℹ️ 予定日（{planned}）より前ですが、このまま進めます")
+    return post_url(draft)
+
+
+def _confirm_daily_pace() -> bool:
+    """1日の投稿数が上限に達していたら確認する"""
+    count = posts_today()
+    if count < MAX_POSTS_PER_DAY:
+        return True
+    print(f"\n   ⚠️ 今日はすでに{count}件投稿しています（目安は1日{MAX_POSTS_PER_DAY}件まで）")
+    print("   楽天アフィリエイトは、繰り返し投稿がスパムと判定されると利用停止の対象になります")
+    return ask_yn("   それでも続けますか？", False)
+
+
 def main():
     # --queue オプション: 予約一覧を表示して終了
     if len(sys.argv) > 1 and sys.argv[1] == "--queue":
@@ -850,15 +1122,54 @@ def main():
     threads_client = ThreadsClient()
     posted_items = load_posted_items()
 
+    # 下書きや画像選択をした後で投稿に失敗しないよう、先にトークンを確認
+    token_ok, token_message = threads_client.check_token()
+    if token_ok:
+        age = token_age_days()
+        age_note = f"（トークン保存から{age}日）" if age is not None else ""
+        print(f"   ✅ Threads: @{token_message}{age_note}")
+        if age is not None and age >= REFRESH_WARNING_DAYS:
+            print("   ⚠️ トークンの期限（60日）が近いです → py token_tool.py refresh")
+    else:
+        print(f"   ❌ Threadsトークンが無効です: {token_message}")
+        print("   → 投稿はできません。手順書「Threadsトークンの再発行」を参照")
+        if not ask_yn("   このまま続けますか？（下書きの確認だけ）", False):
+            return
+
+    # GitHub Actions で予約投稿された結果を取り込む（投稿ログ・ストック・管理表に反映）
+    summary = queue_sync.sync_results()
+    _print_sync_summary(summary)
+    pending = queue_sync.pending_entries()
+    if pending:
+        print(f"   📅 予約中: {len(pending)}件（一覧・取り消し: py tool.py --queue）")
+    if any(summary.values()):
+        export_sheet_quietly()
+
     while True:
+        print()
+        print_stock_summary()
+        today = date.today().isoformat()
+        has_due = any(
+            cc_draft_ready(d) and d.get("planned_date") and d["planned_date"] <= today and not d.get("queued_at")
+            for d in load_stock()
+        )
+
         print("\n   ┌─────────────────────────┐")
         print("   │ 1. 商品投稿（楽天URL）   │")
         print("   │ 2. コンテンツ投稿（リンクなし）│")
+        print("   │ 3. ストックから投稿      │")
         print("   └─────────────────────────┘")
-        mode = ask("   選択", "1")
+        mode = ask("   選択", "3" if has_due else "1")
 
         if mode == "2":
             process_content_post(threads_client)
+            continue
+
+        if mode == "3":
+            url = _pick_from_stock()
+            if url and _confirm_daily_pace():
+                process_one_product(url, uploader, threads_client, posted_items)
+                posted_items = load_posted_items()
             continue
 
         # --- 商品投稿モード ---
@@ -869,13 +1180,15 @@ def main():
 
         # 複数URL対応（スペース区切り）
         urls = url_input.split()
-        urls = [u for u in urls if "rakuten.co.jp" in u]
+        urls = [u for u in urls if "rakuten.co.jp" in u or "r10.to" in u]
 
         if not urls:
             print("   ⚠️ 楽天のURLを入力してください")
             continue
 
         for url in urls:
+            if not _confirm_daily_pace():
+                break
             process_one_product(url, uploader, threads_client, posted_items)
             posted_items = load_posted_items()
 

@@ -1,8 +1,17 @@
+# --- 秘密情報（絶対にコミットしない） ---
 .env
-output/
-# キューとログはgit管理する（GitHub Actionsで必要）
-!output/post_queue.json
-!output/posts_log.jsonl
+.env.*
+!.env.example
+
+# --- 出力（投稿ログ・下書き・画像など） ---
+# 予約キューだけは GitHub Actions が読むので管理する（トークンは入れない）
+output/*
+!output/queue/
+
+# --- 個人の環境に依存するもの（パスにユーザー名が入る） ---
+run_post.bat
+docs/手順書_*.md
+*.xlsx
+
 __pycache__/
 *.pyc
-run_post.bat

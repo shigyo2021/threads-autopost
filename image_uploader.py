@@ -99,7 +99,10 @@ class ImgBBUploader:
             timeout=60,
         )
         resp.raise_for_status()
-        return resp.json()["data"]["url"]
+        data = resp.json()["data"]
+        # display_url = 直接アクセス可能な画像URL（Threads API互換）
+        image_url = data.get("display_url") or data.get("image", {}).get("url") or data["url"]
+        return image_url
 
 
 class LocalServerUploader:

@@ -1,12 +1,16 @@
 """楽天商品検索API + アフィリエイトリンク生成"""
 
 import html
+import json
 import re
 import random
+import time
 import requests
+from urllib.parse import parse_qs, unquote, urlparse
 from config import RAKUTEN_APP_ID, RAKUTEN_ACCESS_KEY, RAKUTEN_AFFILIATE_ID, RAKUTEN_GENRES
 
-SEARCH_URL = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20220601"
+# 末尾の日付はAPIバージョン。古い日付は "API Configuration not found" の400になる
+SEARCH_URL = "https://openapi.rakuten.co.jp/ichibams/api/IchibaItem/Search/20260701"
 
 # 商品名に含まれていたら除外するキーワード（宣伝的・オーダー品・セット売り等）
 EXCLUDE_KEYWORDS = [
@@ -120,6 +124,67 @@ def _should_exclude(name: str) -> bool:
     return False
 
 
+# 楽天アフィリエイトの「SNSボタン」で作ったリンクは、転送先の rafmid でSNSが分かる（2026-09-15 実測）
+SNS_BY_RAFMID = {"0103": "Threads", "0101": "X", "0201": "YouTube", "0002": "note", "0106": "Pinterest"}
+
+
+def affiliate_link_sns(url: str) -> str | None:
+    """アフィリエイトリンクがどのSNS用に作られたか（SNSボタンのリンクでなければ None）"""
+    target = url.strip()
+    if "r10.to" in target:
+        try:
+            target = requests.get(target, allow_redirects=False, timeout=15).headers.get("Location", "")
+        except requests.RequestException:
+            return None
+    if "hb.afl.rakuten.co.jp" not in target:
+        return None
+    rafmid = parse_qs(urlparse(target).query).get("rafmid", [None])[0]
+    return SNS_BY_RAFMID.get(rafmid)
+
+
+def normalize_rakuten_url(url: str) -> str:
+    """
+    アフィリエイトリンク（hb.afl.rakuten.co.jp）や短縮URL（r10.to）を
+    商品ページURL（item.rakuten.co.jp）に戻す。
+    """
+    url = url.strip()
+
+    if "r10.to" in url:
+        try:
+            url = requests.get(url, timeout=15, allow_redirects=True).url
+        except requests.RequestException:
+            return url
+
+    if "hb.afl.rakuten.co.jp" in url:
+        query = parse_qs(urlparse(url).query)
+        if query.get("pc"):
+            url = query["pc"][0]  # parse_qs がデコード済み
+
+    return url
+
+
+def _build_keyword(text: str, max_length: int = 40) -> str:
+    """
+    検索キーワードを作る。楽天APIは1文字の単語を含むと400を返すので除き、
+    長すぎるとヒットしないので単語単位で max_length 文字までにする。
+    """
+    words = []
+    for word in text.split():
+        if len(word) < 2:
+            continue
+        if len(" ".join(words + [word])) > max_length:
+            break
+        words.append(word)
+    return " ".join(words)
+
+
+def _is_same_item(item: dict, shop_url_name: str, item_path: str) -> bool:
+    """APIの商品が、URLの商品ページと同じものか"""
+    # affiliateId を渡すと itemUrl はアフィリエイトリンクになり、商品URLはエンコードされて入る
+    item_url = unquote(item.get("itemUrl", ""))
+    return f"/{shop_url_name}/{item_path}/" in item_url or item_url.rstrip("/").endswith(f"/{shop_url_name}/{item_path}")
+
+
 def fetch_product_by_url(rakuten_url: str) -> dict:
     """
     楽天商品URLから商品情報を取得する（URL指定モード用）。
@@ -139,6 +204,8 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
     Returns:
         商品情報dict（search_productsと同じ形式）
     """
+    rakuten_url = normalize_rakuten_url(rakuten_url)
+
     # URLからショップ名と商品パスを抽出
     match = re.search(r"item\.rakuten\.co\.jp/([^/]+)/([^/?#]+)", rakuten_url)
     if not match:
@@ -166,61 +233,45 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
         keyword = re.sub(r"（[^）]*）", "", keyword)       # （）内を除去
         keyword = re.sub(r"\([^)]*\)", "", keyword)        # ()内を除去
         keyword = re.sub(r"約[０-９0-9×x\.\s]+[ａ-ｚa-zＡ-Ｚ]*", "", keyword)  # 約36×26×31cm等
-        keyword = keyword.strip()[:40]  # 長すぎるとヒットしないので制限
+        keyword = _build_keyword(keyword)
 
     if not keyword:
         # ページ取得失敗時はURLパスからキーワード生成
-        keyword = re.sub(r"[-_]", " ", item_path).strip()
+        keyword = _build_keyword(re.sub(r"[-_]", " ", item_path))
 
-    items = _search_in_shop(shop_code, keyword)
+    # Step 3: キーワードを段階的に短くし、shopCodeのハイフン有無も試して、URLと一致する商品を探す
+    words = keyword.split()
+    keywords = list(dict.fromkeys([keyword, " ".join(words[:3]), " ".join(words[:1]), None]))
+    shop_codes = list(dict.fromkeys([shop_url_name, shop_url_name.replace("-", "")]))
 
-    # Step 3: shopCodeのハイフン有無を切り替えて再試行
-    if not items:
-        alt_shop_code = shop_url_name.replace("-", "") if "-" in shop_url_name else shop_url_name
-        if alt_shop_code != shop_code:
-            items = _search_in_shop(alt_shop_code, keyword)
-            if items:
-                shop_code = alt_shop_code
-
-    # Step 4: キーワードを短くして再検索
-    if not items and keyword:
-        short_keyword = " ".join(keyword.split()[:3])
-        items = _search_in_shop(shop_code, short_keyword)
-
-    # Step 5: それでもダメならshopCode全商品から探す
-    if not items:
-        items = _search_in_shop(shop_code, None)
-
-    if not items:
-        raise ValueError(f"商品が見つかりません: {shop_code}/{item_path}")
-
-    # 最も一致する商品を選択（item_pathとの照合を優先）
     best_item = None
-    for item_wrapper in items:
-        item = item_wrapper["Item"]
-        # itemCodeやitemUrlにitem_pathが含まれていれば一致
-        item_url = item.get("itemUrl", "")
-        if item_path in item.get("itemCode", "") or item_path in item_url:
-            best_item = item
+    attempts = 0
+    for shop_code in shop_codes:
+        for kw in keywords:
+            if attempts:
+                time.sleep(1.1)  # レート制限: 1リクエスト/秒
+            attempts += 1
+            for item_wrapper in _search_in_shop(shop_code, kw or None):
+                if _is_same_item(item_wrapper["Item"], shop_url_name, item_path):
+                    best_item = item_wrapper["Item"]
+                    break
+            if best_item:
+                break
+        if best_item:
             break
 
-    # 一致するものがなければ、キーワード検索結果の1件目を使用
-    # （shopCode全商品フォールバック時は無関係な商品の可能性があるので警告）
+    # 一致しない商品を使うと、別商品のアフィリエイトリンクを投稿してしまうので中止する
     if best_item is None:
-        if keyword:
-            best_item = items[0]["Item"]
-        else:
-            raise ValueError(
-                f"商品が見つかりません: {shop_code}/{item_path}\n"
-                "ヒント: 商品ページが存在するか確認してください。"
-            )
+        raise ValueError(
+            f"URLの商品を楽天APIで特定できませんでした: {shop_url_name}/{item_path}\n"
+            "ヒント: 商品ページが存在するか、売り切れ・非公開になっていないか確認してください。"
+        )
 
     # 画像URL取得: まずページスクレイピングで全画像を取得（リトライ付き）
     all_image_urls = _scrape_product_images(rakuten_url, item_path)
 
     if not all_image_urls:
         print("   ⚠️ 画像スクレイピング1回目失敗、リトライ中...")
-        import time
         time.sleep(2)
         all_image_urls = _scrape_product_images(rakuten_url, item_path)
 
@@ -246,6 +297,7 @@ def fetch_product_by_url(rakuten_url: str) -> dict:
         "review_count": best_item.get("reviewCount", 0),
         "category": "手動選定",
         "item_code": best_item["itemCode"],
+        "caption": best_item.get("itemCaption", ""),
     }
 
 
@@ -257,12 +309,14 @@ def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
     商品ページには5〜15枚の画像があることが多い。
 
     戦略:
-      1. item_pathを含む画像URLを探す（従来方式）
+      0. ページに埋め込まれた商品データ（item-page-app-data）のギャラリー画像を使う（表示順どおり・正確）
+      1. 0が使えない場合、item_pathを含む画像URLを探す（従来方式）
       2. 見つからない場合、image.rakuten.co.jp/{shop}/cabinet/ の画像を収集し、
          共通プレフィックスで最大グループを商品画像と判定する
+         （同じショップの別商品の画像が混ざることがある）
 
     Returns:
-        画像URLリスト（重複除去・ソート済み）
+        画像URLリスト（重複除去済み）
     """
     # URLからショップ名を抽出
     shop_match = re.search(r"item\.rakuten\.co\.jp/([^/]+)/", page_url)
@@ -276,6 +330,11 @@ def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
         )
         if resp.status_code != 200:
             return []
+
+        # --- 方式0: 埋め込みの商品データ ---
+        gallery = _gallery_images_from_page_data(resp.text)
+        if gallery:
+            return gallery
 
         all_urls = re.findall(r'https?://[^\"\' >]+', resp.text)
         img_exts = ('.jpg', '.jpeg', '.png', '.webp')
@@ -359,6 +418,31 @@ def _scrape_product_images(page_url: str, item_path: str) -> list[str]:
         return []
 
 
+def _gallery_images_from_page_data(page_html: str) -> list[str]:
+    """
+    商品ページの <script id="item-page-app-data"> に入っている、ギャラリー画像のURLを表示順で返す。
+    （2026-09時点の構造: ...itemInfoSku.media.images[].location）
+    """
+    match = re.search(r'<script[^>]*id="item-page-app-data"[^>]*>(.*?)</script>', page_html, re.S)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+
+    for root in (data.get("api", {}).get("data", {}), data.get("newApi", {})):
+        images = root.get("itemInfoSku", {}).get("media", {}).get("images", [])
+        urls = []
+        for image in images:
+            location = image.get("location", "") if isinstance(image, dict) else ""
+            if location.startswith("http") and location not in urls:
+                urls.append(location)
+        if urls:
+            return urls
+    return []
+
+
 def _natural_sort_key(url: str):
     """自然数ソート用キー（_1, _2, ..., _10 が正しい順になる）"""
     filename = url.split("/")[-1]
@@ -393,7 +477,7 @@ def _search_in_shop(shop_code: str, keyword: str | None) -> list:
         "accessKey": RAKUTEN_ACCESS_KEY,
         "affiliateId": RAKUTEN_AFFILIATE_ID,
         "shopCode": shop_code,
-        "hits": 10,
+        "hits": 30,
     }
     if keyword:
         params["keyword"] = keyword

@@ -7,6 +7,8 @@ from config import (
     REPLY_GENERATION_SYSTEM_PROMPT,
     CONTENT_GENERATION_SYSTEM_PROMPT,
     ROOM_STYLES,
+    CLAUDE_MODEL,
+    CLAUDE_FAST_MODEL,
 )
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -56,7 +58,7 @@ def generate_post_text(
     user_prompt += "\n\n投稿文のみを出力してください。前置きや説明は不要です。"
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=800,
         system=POST_GENERATION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -87,20 +89,26 @@ def generate_reply_text(product: dict) -> str:
 返信文のみを出力してください。前置きや説明は不要です。"""
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=300,
         system=REPLY_GENERATION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
     )
 
-    text = response.content[0].text.strip()
+    return finalize_reply_text(response.content[0].text, product["url"])
 
-    # [LINK]を実際のURLに置換
-    text = text.replace("[LINK]", product["url"])
 
-    # prが含まれていなければ追加
-    if not text.strip().endswith("pr"):
-        text = text.strip() + "\npr"
+def finalize_reply_text(text: str, affiliate_url: str) -> str:
+    """返信文の[LINK]をURLに置換し、末尾にprを付ける（API不使用）"""
+    text = text.strip()
+
+    if "[LINK]" in text:
+        text = text.replace("[LINK]", affiliate_url)
+    elif affiliate_url not in text:
+        text = f"{text}\n{affiliate_url}"
+
+    if not text.endswith("pr"):
+        text = text + "\npr"
 
     return text
 
@@ -128,7 +136,7 @@ def generate_content_text(topic: str, topic_label: str, past_posts: list[str] | 
     user_prompt += "\n\n投稿文のみを出力してください。前置きや説明は不要です。"
 
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=500,
         system=CONTENT_GENERATION_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_prompt}],
@@ -141,7 +149,7 @@ def generate_content_text(topic: str, topic_label: str, past_posts: list[str] | 
 def extract_image_keywords(post_text: str) -> str:
     """投稿文から画像検索用の英語キーワードを抽出する"""
     response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
+        model=CLAUDE_FAST_MODEL,
         max_tokens=50,
         messages=[{"role": "user", "content": f"""以下の日本語投稿文に合うストックフォトを検索するための英語キーワードを1〜3語で出力してください。
 インテリア・部屋の写真が見つかるようなキーワードにしてください。

@@ -4,7 +4,7 @@ import json
 import os
 import re
 import anthropic
-from config import ANTHROPIC_API_KEY, POSTS_LOG
+from config import ANTHROPIC_API_KEY, POSTS_LOG, CLAUDE_MODEL
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -45,7 +45,7 @@ def score_post(post_text: str, product_name: str) -> dict:
         {"score": int, "details": list[int], "reason": str, "passed": bool}
     """
     response = client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=200,
         system=SCORING_SYSTEM_PROMPT,
         messages=[{
@@ -81,7 +81,45 @@ def score_post(post_text: str, product_name: str) -> dict:
     }
 
 
-def check_similarity(new_text: str, threshold: float = 0.5) -> dict:
+NG_PHRASES = [
+    "だなぁ", "素敵", "いいよね", "ですね", "おすすめ", "必見", "マスト",
+    "生活が豊かに", "暮らしが変わる", "ここだけの話", "正直に言います",
+    "使ってみました", "AI生成",
+]
+NG_EMOJIS = ["✨", "🌟", "💡", "🏠"]
+
+
+def lint_post(post_text: str, max_length: int = 120) -> list[str]:
+    """
+    APIを使わないルールチェック（投稿文生成プロンプトの禁止事項に対応）。
+
+    Args:
+        max_length: 本文の文字数の上限（商品投稿120／リンクなし投稿150）
+
+    Returns:
+        警告メッセージのリスト（空なら問題なし）
+    """
+    warnings = []
+    body = _strip_hashtags(post_text)
+    hashtags = re.findall(r"#\S+", post_text)
+
+    for phrase in NG_PHRASES + NG_EMOJIS:
+        if phrase in post_text:
+            warnings.append(f"NG表現「{phrase}」")
+    if "http" in post_text or "[LINK]" in post_text:
+        warnings.append("本文にリンクがある（リンクは返信に入れる）")
+    if re.search(r"(^|\n)\s*pr\s*$", post_text, re.IGNORECASE):
+        warnings.append("本文にpr表記がある（prは返信に入れる）")
+    if len(body) > max_length:
+        warnings.append(f"本文が長い（{len(body)}文字／上限{max_length}文字）")
+    # Threadsのトピックタグは1投稿1つ。APIでは本文の最初のハッシュタグだけがタグになる
+    if len(hashtags) != 1:
+        warnings.append(f"ハッシュタグが{len(hashtags)}個（Threadsのタグは1投稿1つなので1個にする）")
+
+    return warnings
+
+
+def check_similarity(new_text: str, threshold: float = 0.5, extra_texts: list[str] | None = None) -> dict:
     """
     新しい投稿文と過去の投稿文の類似度をチェック。
 
@@ -91,7 +129,7 @@ def check_similarity(new_text: str, threshold: float = 0.5) -> dict:
     Returns:
         {"is_unique": bool, "max_similarity": float, "similar_to": str|None}
     """
-    past_texts = _load_past_post_texts()
+    past_texts = _load_past_post_texts() + (extra_texts or [])
 
     if not past_texts:
         return {"is_unique": True, "max_similarity": 0.0, "similar_to": None}

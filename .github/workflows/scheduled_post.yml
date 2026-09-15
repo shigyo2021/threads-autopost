@@ -2,58 +2,63 @@ name: Process Scheduled Posts
 
 on:
   schedule:
-    # 30分ごとにチェック（JST 0:00〜23:30）
-    - cron: '0,30 * * * *'
-  workflow_dispatch:  # 手動実行も可能
+    # 15分ごと。混雑する毎時0分・30分は避ける（GitHubの定時実行は数分〜数十分遅れることがある）
+    - cron: '4,19,34,49 * * * *'
+  workflow_dispatch:
+
+# リポジトリへの書き込み（キューの状態更新）以外の権限は与えない
+permissions:
+  contents: write
+
+# 同時に2つ動いて二重投稿しないように
+concurrency:
+  group: scheduled-posts
+  cancel-in-progress: false
 
 jobs:
   process:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Tokyo
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
-      - name: Check queue file exists
+      # 標準ライブラリだけで判定する（ライブラリのインストールもシークレットの受け渡しもしない）
+      - name: Check due posts
         id: check
-        run: |
-          if [ -f "output/post_queue.json" ]; then
-            PENDING=$(python3 -c "
-          import json
-          with open('output/post_queue.json') as f:
-              q = json.load(f)
-          print(sum(1 for e in q if e.get('status') == 'pending'))
-          ")
-            echo "pending=$PENDING" >> $GITHUB_OUTPUT
-            echo "📋 Pending posts: $PENDING"
-          else
-            echo "pending=0" >> $GITHUB_OUTPUT
-            echo "📭 No queue file"
-          fi
+        run: python3 process_queue.py --check
 
       - name: Set up Python
-        if: steps.check.outputs.pending != '0'
+        if: steps.check.outputs.due != '0'
         uses: actions/setup-python@v5.6.0
         with:
           python-version: '3.12'
 
       - name: Install dependencies
-        if: steps.check.outputs.pending != '0'
-        run: pip install -r requirements.txt
+        if: steps.check.outputs.due != '0'
+        run: pip install requests python-dotenv
 
-      - name: Process scheduled posts
-        if: steps.check.outputs.pending != '0'
+      # シークレットはこのステップだけに渡す。公開ログに出る値は GitHub が伏せ字にし、
+      # さらに process_queue.py 側でもトークンらしき文字列を伏せ字にしている
+      - name: Post due entries
+        if: steps.check.outputs.due != '0'
         env:
           THREADS_USER_ID: ${{ secrets.THREADS_USER_ID }}
           THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python process_queue.py
 
-      - name: Commit queue changes
-        if: steps.check.outputs.pending != '0'
+      - name: Save queue status
+        if: always() && steps.check.outputs.due != '0'
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add output/post_queue.json output/posts_log.jsonl || true
-          git diff --staged --quiet || git commit -m "Process scheduled posts [bot]"
-          git push || true
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/queue
+          if git diff --staged --quiet; then
+            echo "変更なし"
+            exit 0
+          fi
+          git commit -m "Update scheduled post status [bot]"
+          for i in 1 2 3; do
+            git pull --rebase && git push && exit 0
+            sleep 5
+          done
+          exit 1

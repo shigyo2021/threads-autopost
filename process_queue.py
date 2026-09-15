@@ -1,177 +1,105 @@
-"""予約キュー処理: 投稿時刻が来た予約をThreadsに投稿する（GitHub Actions用）"""
+"""予約キュー処理: 投稿時刻が来た予約をThreadsに投稿する（GitHub Actions用）
 
-import io
-import sys
-import platform
+    python process_queue.py --check   時間が来た予約の件数だけを出す（標準ライブラリのみ・投稿しない）
+    python process_queue.py           時間が来た予約を投稿する
 
-if platform.system() == "Windows":
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+公開リポジトリで動くので、ログやキューファイルにトークンを出さない（queue_store.redact を通す）。
+投稿ログ（posts_log.jsonl）は書かない。結果はキューファイルの status に残し、PC側の tool.py が取り込む。
+"""
 
-import json
 import os
+import sys
 from datetime import datetime
 
-from config import OUTPUT_DIR, POSTS_LOG
-from threads_api import ThreadsClient
-
-QUEUE_FILE = os.path.join(OUTPUT_DIR, "post_queue.json")
+import queue_store as qs
 
 
-def load_queue() -> list[dict]:
-    if os.path.exists(QUEUE_FILE):
-        with open(QUEUE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return []
+def count_due() -> int:
+    now = qs.now_jst()
+    return sum(1 for _, entry in qs.load_entries() if qs.is_due(entry, now))
 
 
-def save_queue(queue: list[dict]):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(QUEUE_FILE, "w", encoding="utf-8") as f:
-        json.dump(queue, f, ensure_ascii=False, indent=2)
+def _label(entry: dict) -> str:
+    return entry.get("label") or entry.get("name", "")[:20]
 
 
-def log_post(entry: dict):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(POSTS_LOG, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+def _record_error(path: str, entry: dict, error: Exception):
+    entry["retry_count"] = entry.get("retry_count", 0) + 1
+    entry["last_error"] = qs.redact(error)[:300]
+    if entry["retry_count"] >= 3:
+        entry["status"] = qs.STATUS_ERROR
+        print(f"      ❌ 3回失敗したので中止: {entry['last_error']}")
+    else:
+        print(f"      ⚠️ 失敗（{entry['retry_count']}/3回目、次回また試す）: {entry['last_error']}")
+    qs.save_entry(path, entry)
 
 
-def load_posted_items() -> set:
-    """投稿済み商品コードをPOSTS_LOGから読み込む（重複投稿防止）"""
-    posted = set()
-    if os.path.exists(POSTS_LOG):
-        with open(POSTS_LOG, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    code = entry.get("item_code", "")
-                    if code:
-                        posted.add(code)
-                except json.JSONDecodeError:
-                    pass
+def process_queue() -> int:
+    from threads_api import ThreadsClient
+
+    now = qs.now_jst()
+    entries = qs.load_entries()
+    print(f"📅 予約キュー処理: {now:%Y-%m-%d %H:%M}（JST） 予約{len(entries)}件")
+
+    client = ThreadsClient(
+        user_id=os.environ.get("THREADS_USER_ID", ""),
+        access_token=os.environ.get("THREADS_ACCESS_TOKEN", ""),
+    )
+    posted = 0
+
+    for path, entry in entries:
+        if not qs.is_due(entry, now):
+            continue
+
+        scheduled = datetime.fromisoformat(entry["scheduled_at"])
+        if now - scheduled > qs.MAX_DELAY:
+            entry["status"] = qs.STATUS_EXPIRED
+            entry["last_error"] = f"予定時刻（{scheduled:%m/%d %H:%M}）から3時間以上遅れたため投稿しなかった"
+            qs.save_entry(path, entry)
+            print(f"   ⏭️ 期限切れ: {_label(entry)}")
+            continue
+
+        print(f"   📤 {scheduled:%m/%d %H:%M} {_label(entry)}")
+
+        # 本文の投稿が済んでいたら（前回は返信だけ失敗した）、本文は出し直さない
+        if not entry.get("post_id"):
+            try:
+                image_urls = entry["image_urls"]
+                if len(image_urls) >= 2:
+                    result = client.publish_carousel_post(text=entry["post_text"], image_urls=image_urls)
+                else:
+                    result = client.publish_image_post(text=entry["post_text"], image_url=image_urls[0])
+                entry["post_id"] = result.get("id", "")
+                entry["posted_at"] = qs.now_jst().isoformat(timespec="seconds")
+                qs.save_entry(path, entry)
+                print(f"      ✅ 本文を投稿")
+            except Exception as e:
+                _record_error(path, entry, e)
+                continue
+
+        try:
+            reply = client.publish_reply(text=entry["reply_text"], reply_to_id=entry["post_id"])
+            entry["reply_id"] = reply.get("id", "")
+            entry["status"] = qs.STATUS_POSTED
+            entry.pop("last_error", None)
+            qs.save_entry(path, entry)
+            posted += 1
+            print(f"      ✅ 返信（リンク）を投稿")
+        except Exception as e:
+            _record_error(path, entry, e)
+
+    print(f"✅ 完了: {posted}件投稿")
     return posted
 
 
-def process_queue():
-    """投稿時刻が来た予約を処理する"""
-    queue = load_queue()
-    now = datetime.now()
-    posted_count = 0
-    changed = False
-
-    print(f"📅 予約キュー処理: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   キュー内: {len(queue)}件\n")
-
-    # 投稿済みアイテムを取得（重複投稿防止）
-    already_posted = load_posted_items()
-
-    threads_client = ThreadsClient()
-
-    for entry in queue:
-        if entry.get("status") != "pending":
-            continue
-
-        # 重複投稿チェック（すでに投稿済みならスキップ）
-        item_code = entry.get("item_code", "")
-        if item_code and item_code in already_posted:
-            print(f"   ⚠️ 投稿済みのためスキップ: {entry.get('name', '')[:40]}")
-            entry["status"] = "skipped_duplicate"
-            changed = True
-            continue
-
-        scheduled_at = entry.get("scheduled_at", "")
-        try:
-            scheduled_time = datetime.fromisoformat(scheduled_at)
-        except (ValueError, TypeError):
-            print(f"   ⚠️ 無効な日時: {scheduled_at}、スキップ")
-            entry["status"] = "error"
-            entry["error"] = "Invalid scheduled_at"
-            changed = True
-            continue
-
-        if scheduled_time > now:
-            remaining = scheduled_time - now
-            hours = remaining.total_seconds() / 3600
-            print(f"   ⏳ {entry['name'][:30]} → あと{hours:.1f}時間")
-            continue
-
-        # --- 投稿時刻到達、投稿実行 ---
-        print(f"   📤 投稿中: {entry['name'][:40]}")
-
-        try:
-            post_text = entry["post_text"]
-            reply_text = entry["reply_text"]
-            image_urls = entry["image_urls"]
-
-            # メイン投稿
-            if len(image_urls) >= 2:
-                result = threads_client.publish_carousel_post(
-                    text=post_text, image_urls=image_urls,
-                )
-            else:
-                result = threads_client.publish_image_post(
-                    text=post_text, image_url=image_urls[0],
-                )
-            post_id = result.get("id", "")
-            print(f"      ✅ メイン投稿完了! ID: {post_id}")
-
-            # 返信
-            reply_result = threads_client.publish_reply(
-                text=reply_text, reply_to_id=post_id,
-            )
-            print(f"      ✅ 返信投稿完了! ID: {reply_result.get('id', '')}")
-
-            # ステータス更新
-            entry["status"] = "posted"
-            entry["posted_at"] = now.isoformat()
-            entry["post_id"] = post_id
-            posted_count += 1
-            changed = True
-
-            # ログ記録
-            log_post({
-                "item_code": entry.get("item_code", ""),
-                "name": entry.get("name", ""),
-                "price": entry.get("price", 0),
-                "url": entry.get("affiliate_url", ""),
-                "style": entry.get("style", ""),
-                "post_text": post_text,
-                "quality_score": entry.get("quality_score", 0),
-                "timestamp": now.isoformat(),
-                "dry_run": False,
-                "scheduled": True,
-            })
-
-        except Exception as e:
-            print(f"      ❌ 投稿エラー: {e}")
-            # リトライ回数を管理（3回まで再試行、超えたらエラー確定）
-            retry_count = entry.get("retry_count", 0) + 1
-            entry["retry_count"] = retry_count
-            entry["last_error"] = str(e)
-            changed = True
-
-            if retry_count >= 3:
-                entry["status"] = "error"
-                print(f"      ⚠️ 3回失敗のため諦めます")
-            else:
-                # pending のまま残して次回再試行
-                print(f"      🔄 次回再試行します（{retry_count}/3回目）")
-
-    # 完了済み・エラー・重複スキップのエントリを削除してキューを整理
-    if changed:
-        # pending以外を削除
-        cleaned = [e for e in queue if e.get("status") == "pending"]
-        removed = len(queue) - len(cleaned)
-        save_queue(cleaned)
-        if removed > 0:
-            print(f"\n   キュー整理: {removed}件削除、{len(cleaned)}件残り")
-        elif cleaned:
-            print(f"\n   キュー: {len(cleaned)}件が次回再試行待ち")
-
-    print(f"\n✅ 処理完了: {posted_count}件投稿")
-    return posted_count
-
-
 if __name__ == "__main__":
-    process_queue()
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if "--check" in sys.argv:
+        due = count_due()
+        print(f"時間が来た予約: {due}件")
+        output = os.environ.get("GITHUB_OUTPUT")
+        if output:
+            with open(output, "a", encoding="utf-8") as f:
+                f.write(f"due={due}\n")
+    else:
+        process_queue()
