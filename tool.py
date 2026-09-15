@@ -457,9 +457,11 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         })
         _cleanup_temp_files(image_paths)
         if ok:
-            print(f"\n   ✅ 予約しました: {scheduled_time[:16].replace('T', ' ')} ごろにGitHub Actionsが投稿します")
-            print("   （混雑すると数分〜数十分遅れることがあります。予約一覧・取り消し: py tool.py --queue）")
+            print(f"\n   ✅ 予約しました: {scheduled_time[:16].replace('T', ' ')} 以降にGitHub Actionsが投稿します")
+            print("   （GitHubの実行は数時間遅れることがあります。予約一覧・取り消し: py tool.py --queue）")
             export_sheet_quietly()
+        else:
+            print("\n   ❌ 予約できませんでした（下書きはストックに残っています）")
         return
     else:
         # --- 今すぐ投稿 ---

@@ -28,9 +28,11 @@ STATUS_EXPIRED = "expired"
 LATEST_POST_HOUR = 22
 MIN_GRACE = timedelta(hours=1)
 
+# RAKUTEN_APP_ID は含めない。楽天APIが返すアフィリエイトリンクの rafcid に楽天自身が埋め込んでおり、
+# 投稿の返信で公開される値のため（APIを使うにはアクセスキーも必要で、そちらは対象にしている）
 _SECRET_ENV_NAMES = (
     "THREADS_ACCESS_TOKEN", "THREADS_APP_SECRET", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-    "RAKUTEN_APP_ID", "RAKUTEN_ACCESS_KEY", "IMGBB_API_KEY", "PEXELS_API_KEY",
+    "RAKUTEN_ACCESS_KEY", "IMGBB_API_KEY", "PEXELS_API_KEY",
 )
 _SECRET_PATTERNS = [
     # 値が「数字を含む16文字以上」のときだけ（コード中の access_token=変数名 は対象外）

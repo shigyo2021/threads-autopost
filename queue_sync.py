@@ -82,7 +82,11 @@ def schedule(entry: dict) -> bool:
 
     entry = {**entry, "status": qs.STATUS_PENDING, "created_at": qs.now_jst().isoformat(timespec="seconds")}
     path = os.path.join(qs.QUEUE_DIR, qs.entry_filename(entry["scheduled_at"], entry["item_code"]))
-    qs.save_entry(path, entry)
+    try:
+        qs.save_entry(path, entry)
+    except ValueError as e:
+        print(f"   ❌ {e}")
+        return False
 
     if not push_queue(f"Schedule post {entry['scheduled_at'][:16]}"):
         return False
