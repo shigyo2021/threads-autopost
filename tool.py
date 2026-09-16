@@ -538,10 +538,11 @@ def _save_drafts(drafts: list[dict]):
         json.dump(drafts, f, ensure_ascii=False, indent=2)
 
 
-def _add_draft(post_text: str, topic_key: str, image_keywords: str | None = None):
-    """下書きに保存"""
+def _add_draft(post_text: str, topic_key: str, image_keywords: str | None = None, extra: dict | None = None):
+    """下書きに保存（extra は format や image_count など、元の下書きにあった項目）"""
     drafts = _load_drafts()
     drafts.append({
+        **(extra or {}),
         "post_text": post_text,
         "topic": topic_key,
         "image_keywords": image_keywords,
@@ -603,7 +604,10 @@ def _search_and_preview_pexels(keywords: str) -> list[dict]:
     return photos
 
 
-def _search_pexels(query: str, count: int = 9) -> list[dict]:
+MAX_CAROUSEL_IMAGES = 20  # Threadsのカルーセルの上限
+
+
+def _search_pexels(query: str, count: int = 24) -> list[dict]:
     """Pexels APIで画像を検索する"""
     import requests
     if not PEXELS_API_KEY:
@@ -684,6 +688,7 @@ def process_content_post(threads_client):
     past_content = _load_past_content()
     topic_label = None
     image_keywords = None
+    draft_extra = {}  # 下書きに戻すときに残す項目（format, image_count, source など）
 
     # 下書きがあれば先に提示（Claude Codeの下書きならAPIを使わない）
     draft = _pick_draft()
@@ -691,6 +696,7 @@ def process_content_post(threads_client):
         post_text = draft["post_text"]
         topic_key = draft.get("topic") or "draft"
         image_keywords = draft.get("image_keywords")
+        draft_extra = {k: v for k, v in draft.items() if k not in ("post_text", "topic", "image_keywords", "created_at")}
         for warning in lint_post(post_text, max_length=150):
             print(f"   ⚠️ {warning}")
     else:
@@ -716,13 +722,14 @@ def process_content_post(threads_client):
         elif edit_choice == "2":
             if topic_label is None:
                 if draft:
-                    _add_draft(post_text, topic_key, image_keywords)  # 元の下書きは残す
+                    _add_draft(post_text, topic_key, image_keywords, draft_extra)  # 元の下書きは残す
                     print("   （元の下書きは残しました）")
                 topic_key, topic_label = _choose_content_topic()
                 image_keywords = None
             print("\n   🔄 生成中...")
             post_text = generate_content_text(topic_key, topic_label, past_content)
             draft = None
+            draft_extra = {}
         elif edit_choice == "3":
             print(f"\n   現在の投稿文:")
             print(f"   {post_text}")
@@ -731,7 +738,7 @@ def process_content_post(threads_client):
                 post_text = new_text
                 print("   ✅ 更新しました")
         elif edit_choice == "4":
-            _add_draft(post_text, topic_key, image_keywords)
+            _add_draft(post_text, topic_key, image_keywords, draft_extra)
             print("   ⏭️ スキップ（下書きに保存しました）")
             return
         else:
@@ -752,6 +759,8 @@ def process_content_post(threads_client):
             print(f"\n   現在の選択済み画像: {len(image_urls)}枚")
 
         print(f"\n   画像の選択:")
+        if draft_extra.get("image_count"):
+            print(f"   （この投稿の目安: {draft_extra['image_count']}枚。Threadsは最大{MAX_CAROUSEL_IMAGES}枚）")
         print(f"   番号  = Pexels画像を使用（例: 3 / 複数: 1,3,5）")
         print(f"   s     = 別のキーワードで再検索")
         print(f"   f     = ローカルファイル（PC内の画像・複数可）")
@@ -760,7 +769,7 @@ def process_content_post(threads_client):
         img_choice = ask("   選択", "")
 
         if img_choice == "x":
-            _add_draft(post_text, topic_key, image_keywords)
+            _add_draft(post_text, topic_key, image_keywords, draft_extra)
             print("   ⏭️ 投稿を中止しました（下書きに保存しました）")
             return
         elif img_choice == "s":
@@ -842,11 +851,16 @@ def process_content_post(threads_client):
             for n in nums:
                 if n.isdigit():
                     idx = int(n)
-                    if 1 <= idx <= len(photos):
+                    if not 1 <= idx <= len(photos):
+                        print(f"   ⚠️ 1〜{len(photos)}の番号を入力してください")
+                    elif photos[idx - 1]["url"] in image_urls:
+                        print(f"   ℹ️ 画像 {idx} はすでに選んでいます")
+                    elif len(image_urls) >= MAX_CAROUSEL_IMAGES:
+                        print(f"   ⚠️ Threadsは1投稿{MAX_CAROUSEL_IMAGES}枚までです")
+                        break
+                    else:
                         image_urls.append(photos[idx - 1]["url"])
                         print(f"   → 画像 {idx} を追加（📷 {photos[idx - 1]['photographer']}）")
-                    else:
-                        print(f"   ⚠️ 1〜{len(photos)}の番号を入力してください")
             if image_urls:
                 print(f"\n   📸 合計 {len(image_urls)}枚 の画像を選択済み")
             continue
@@ -878,7 +892,7 @@ def process_content_post(threads_client):
 
     except Exception as e:
         print(f"   ❌ 投稿エラー: {e}")
-        _add_draft(post_text, topic_key, image_keywords)
+        _add_draft(post_text, topic_key, image_keywords, draft_extra)
         print("   （投稿文は下書きに戻しました）")
 
 
