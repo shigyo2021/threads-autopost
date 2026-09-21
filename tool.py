@@ -29,6 +29,7 @@ from drafts import (
     MAX_POSTS_PER_DAY,
 )
 import queue_sync
+from queue_store import post_deadline
 from image_processor import process_product_images
 from image_uploader import get_uploader
 from threads_api import ThreadsClient
@@ -950,6 +951,13 @@ def _ask_schedule_time(default: datetime | None = None) -> str | None:
     if scheduled <= now + timedelta(minutes=5):
         print("   ⚠️ 5分以上先の日時を指定してください（すぐ出すなら「1. 今すぐ投稿する」）")
         return None
+
+    deadline = post_deadline(scheduled)
+    if deadline - scheduled < timedelta(hours=2):
+        print(f"   ⚠️ GitHubの実行は数時間遅れることがあります。{deadline:%H:%M} を過ぎると投稿されず、ストックに戻ります")
+        if not ask_yn("   このまま予約しますか？", False):
+            return None
+
     print(f"   → {scheduled:%Y-%m-%d %H:%M} に予約")
     return scheduled.isoformat()
 
