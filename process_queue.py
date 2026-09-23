@@ -72,8 +72,12 @@ def process_queue() -> int:
                     result = client.publish_image_post(text=entry["post_text"], image_url=image_urls[0])
                 entry["post_id"] = result.get("id", "")
                 entry["posted_at"] = qs.now_jst().isoformat(timespec="seconds")
+                entry["image_count"] = result.get("image_count", len(image_urls))
                 qs.save_entry(path, entry)
-                print(f"      ✅ 本文を投稿")
+                if entry["image_count"] < len(image_urls):
+                    print(f"      ✅ 本文を投稿（⚠️ 画像は{len(image_urls)}枚中{entry['image_count']}枚だけ）")
+                else:
+                    print(f"      ✅ 本文を投稿（画像{entry['image_count']}枚）")
             except Exception as e:
                 _record_error(path, entry, e)
                 continue

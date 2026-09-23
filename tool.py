@@ -478,7 +478,10 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
                     text=post_text, image_url=uploaded_urls[0],
                 )
             post_id = result.get("id", "")
-            print(f"   ✅ メイン投稿完了! ID: {post_id}")
+            posted_images = result.get("image_count", len(uploaded_urls))
+            print(f"   ✅ メイン投稿完了! ID: {post_id}（画像{posted_images}枚）")
+            if posted_images < len(uploaded_urls):
+                print(f"   ⚠️ 用意した{len(uploaded_urls)}枚のうち{posted_images}枚しか投稿できませんでした")
 
             # 返信
             reply_result = threads_client.publish_reply(
@@ -507,6 +510,7 @@ def process_one_product(url: str, uploader, threads_client, posted_items: set):
         "timestamp": datetime.now().isoformat(),
         "dry_run": False,
         "scheduled": False,
+        "image_count": posted_images,
     })
 
     if text_source == "claude_code":
@@ -879,7 +883,10 @@ def process_content_post(threads_client):
         else:
             result = threads_client.publish_text_post(post_text)
         post_id = result.get("id", "")
-        print(f"   ✅ 投稿完了! ID: {post_id}")
+        posted_images = result.get("image_count", len(image_urls))
+        print(f"   ✅ 投稿完了! ID: {post_id}（画像{posted_images}枚）")
+        if posted_images < len(image_urls):
+            print(f"   ⚠️ 選んだ{len(image_urls)}枚のうち{posted_images}枚しか投稿できませんでした")
 
         # ログ記録
         _log_content({
@@ -887,6 +894,7 @@ def process_content_post(threads_client):
             "post_text": post_text,
             "post_id": post_id,
             "image_urls": image_urls if image_urls else None,
+            "image_count": posted_images,
             "timestamp": datetime.now().isoformat(),
         })
         print(f"\n   ✅ 完了!")
@@ -965,6 +973,9 @@ def _ask_schedule_time(default: datetime | None = None) -> str | None:
 def _print_sync_summary(summary: dict):
     for line in summary["posted"]:
         print(f"   ✅ 予約投稿済み: {line}")
+    for line in summary.get("fewer_images", []):
+        print(f"   ⚠️ 画像が減って投稿された: {line}")
+        print("      → 楽天側で画像が消えたか、Threads APIが一部を弾いています。気になるなら投稿し直してください")
     for line in summary["partial"]:
         print(f"   ⚠️ 本文は投稿済みだが、リンクの返信が付けられなかった: {line}")
         print("      → Threadsアプリでその投稿に返信し、リンクと「pr」を手で付けてください（管理表の返信文をコピー）")

@@ -59,7 +59,7 @@ class ThreadsClient:
             max_retries: 最大リトライ回数
 
         Returns:
-            投稿結果の dict
+            投稿結果の dict（実際に投稿した画像枚数を image_count に入れる）
         """
         last_error = None
         for attempt in range(1, max_retries + 1):
@@ -72,6 +72,7 @@ class ThreadsClient:
 
                 # Step 2: 公開
                 result = self._publish_container(container_id)
+                result["image_count"] = 1
                 return result
             except Exception as e:
                 last_error = e
@@ -90,65 +91,77 @@ class ThreadsClient:
           2. カルーセルコンテナを作成
           3. 公開
 
+        1枚の失敗で全体を捨てないように、画像ごとに作成と待機をまとめて行い、
+        だめだった画像だけを落とす。2枚以上残れば必ずカルーセルとして投稿する。
+
         Args:
             text: 投稿テキスト
             image_urls: 画像URLリスト（2〜20枚）
             max_retries: 最大リトライ回数
+
+        Returns:
+            投稿結果の dict（実際に投稿した画像枚数を image_count に入れる）
         """
         if len(image_urls) < 2:
             # 1枚の場合は通常の画像投稿にフォールバック
             return self.publish_image_post(text, image_urls[0], max_retries)
 
-        try:
-            # 画像URLのアクセス確認（CDN伝播待ち）
-            print(f"      画像URLの確認中...")
-            for img_url in image_urls:
-                self._verify_image_url(img_url)
-
-            # Step 1: 各画像のメディアコンテナを作成（失敗した画像はスキップ）
-            child_ids = []
-            valid_urls = []
-            for img_url in image_urls:
-                try:
-                    child_id = self._create_carousel_item(img_url)
-                    child_ids.append(child_id)
-                    valid_urls.append(img_url)
-                except Exception as item_err:
-                    print(f"      ⚠️ 画像スキップ（API拒否）: {img_url[:60]}...")
-                    continue
-
-            if len(child_ids) < 2:
-                # 有効な画像が1枚以下 → 単一画像投稿にフォールバック
-                fallback_url = valid_urls[0] if valid_urls else image_urls[0]
-                print(f"      → 有効な画像が{len(child_ids)}枚のため1枚画像で投稿します")
-                return self.publish_image_post(text, fallback_url, max_retries)
-
-            print(f"      → {len(child_ids)}/{len(image_urls)}枚の画像でカルーセル作成")
-
-            # 全コンテナの処理完了を待機
-            for child_id in child_ids:
+        # Step 1: 各画像のメディアコンテナを作成して処理完了まで待つ（失敗した画像だけスキップ）
+        print(f"      画像URLの確認中...")
+        child_ids = []
+        valid_urls = []
+        for img_url in image_urls:
+            # 確認が通らなくてもAPIには投げる（HEADを弾くだけのサーバーもあるため）
+            self._verify_image_url(img_url)
+            try:
+                child_id = self._create_carousel_item(img_url)
                 self._wait_for_container(child_id)
+            except Exception as item_err:
+                print(f"      ⚠️ 画像スキップ（{type(item_err).__name__}）: {img_url[:60]}...")
+                continue
+            child_ids.append(child_id)
+            valid_urls.append(img_url)
 
-            # Step 2: カルーセルコンテナを作成
-            carousel_id = self._create_carousel_container(text, child_ids)
-            self._wait_for_container(carousel_id)
+        if len(child_ids) < 2:
+            # 有効な画像が1枚以下 → カルーセルを作れないので1枚で投稿する
+            fallback_url = valid_urls[0] if valid_urls else image_urls[0]
+            print(f"      ⚠️ 使える画像が{len(child_ids)}枚しかないため、{len(image_urls)}枚のうち1枚だけで投稿します")
+            return self.publish_image_post(text, fallback_url, max_retries)
 
-            # Step 3: 公開
-            result = self._publish_container(carousel_id)
-            return result
-        except Exception as e:
-            print(f"      ⚠️ カルーセル投稿失敗: {redact(e)}")
-            print(f"      → 1枚画像で投稿します")
-            return self.publish_image_post(text, image_urls[0], max_retries)
+        print(f"      → {len(child_ids)}/{len(image_urls)}枚の画像でカルーセル作成")
 
-    def _verify_image_url(self, image_url: str, max_retries: int = 5):
+        # Step 2: カルーセルコンテナを作成（公開はしないのでリトライしてよい）
+        last_error = None
+        ready_id = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                carousel_id = self._create_carousel_container(text, child_ids)
+                self._wait_for_container(carousel_id)
+                ready_id = carousel_id
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries:
+                    wait = 10 * attempt
+                    print(f"      ⚠️ カルーセル作成リトライ ({attempt}/{max_retries})... {wait}秒待機")
+                    time.sleep(wait)
+        if ready_id is None:
+            # ここで1枚に落とすと画像が減ったことに気づけないので、呼び出し元にエラーを返す
+            raise ThreadsAPIError(redact(f"カルーセルを作成できなかった: {last_error}"))
+
+        # Step 3: 公開（二重投稿になりうるのでリトライしない）
+        result = self._publish_container(ready_id)
+        result["image_count"] = len(child_ids)
+        return result
+
+    def _verify_image_url(self, image_url: str, max_retries: int = 5) -> bool:
         """画像URLがアクセス可能か確認（CDN伝播待ち対応）"""
         for attempt in range(max_retries):
             try:
                 resp = requests.head(image_url, timeout=10, allow_redirects=True)
                 content_type = resp.headers.get("content-type", "")
                 if resp.ok and "image" in content_type:
-                    return
+                    return True
                 # 200だがcontent-typeが画像でない場合
                 if resp.ok:
                     print(f"      [DEBUG] URL応答OK但しContent-Type: {content_type}")
@@ -159,6 +172,7 @@ class ThreadsClient:
                 print(f"      ⏳ 画像URL確認待ち ({attempt+1}/{max_retries})... {wait}秒")
                 time.sleep(wait)
         print(f"      ⚠️ 画像URLの確認タイムアウト（投稿を試行します）: {image_url[:60]}...")
+        return False
 
     def _create_carousel_item(self, image_url: str) -> str:
         """カルーセル用の画像アイテムコンテナを作成"""

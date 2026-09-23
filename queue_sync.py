@@ -118,6 +118,7 @@ def _append_posts_log(entry: dict):
         "dry_run": False,
         "scheduled": True,
         "post_id": entry.get("post_id", ""),
+        "image_count": entry.get("image_count", len(entry.get("image_urls", []))),
     }
     with open(POSTS_LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(log, ensure_ascii=False) + "\n")
@@ -131,7 +132,7 @@ def _unqueue_draft(item_code: str):
 
 def sync_results() -> dict:
     """GitHub Actions の投稿結果を取り込む。投稿済み→ログに記録してストックから外す／失敗→ストックに戻す"""
-    summary = {"posted": [], "partial": [], "failed": []}
+    summary = {"posted": [], "partial": [], "failed": [], "fewer_images": []}
     if not pull():
         return summary
 
@@ -140,6 +141,11 @@ def sync_results() -> dict:
         status = entry.get("status")
         label = entry.get("label") or entry.get("name", "")[:20]
         when = entry.get("scheduled_at", "")[5:16].replace("T", " ")
+        planned_images = len(entry.get("image_urls", []))
+        sent_images = entry.get("image_count", planned_images)
+
+        if status in (qs.STATUS_POSTED, qs.STATUS_ERROR) and entry.get("post_id") and sent_images < planned_images:
+            summary["fewer_images"].append(f"{when} {label}: {planned_images}枚中{sent_images}枚")
 
         if status == qs.STATUS_POSTED:
             _append_posts_log(entry)
