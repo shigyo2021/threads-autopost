@@ -27,6 +27,7 @@
   "quality_score": 6,
   "text_source": "claude_code",
   "scheduled_at": "2026-09-25T18:30:00",
-  "status": "pending",
-  "created_at": "2026-09-25T15:07:08"
+  "status": "expired",
+  "created_at": "2026-09-25T15:07:08",
+  "last_error": "予定（09/25 18:30）のあと 09/25 22:00 までに実行されなかったため投稿しなかった"
 }
