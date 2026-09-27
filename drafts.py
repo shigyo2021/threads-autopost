@@ -4,8 +4,13 @@
     （下書きファイルの post_text / reply_text を書き込む）
     py drafts.py check <item_code>        ルールチェック + 過去投稿との類似度チェック
     py drafts.py list                     ストック一覧（投稿予定日・時間つき）
-    py drafts.py plan [1日の件数]          予定のない下書きに、空いている投稿枠を順番に割り当てる（既定: 1日2件）
-    py drafts.py replan [1日の件数]        手動で決めた予定以外をいったん外して、割り当て直す
+    py drafts.py plan [1日の件数]          予定のない下書きに、空いている投稿枠を順番に割り当てる（既定: 1日2件）。
+                                          ¥5,000以上の商品はセール・ポイントアップの日に寄せる
+    py drafts.py replan [1日の件数]        手動で決めた予定と予約済み以外をいったん外して、割り当て直す
+    py drafts.py sale                     セール期間と、これから30日のセールの日を一覧
+    py drafts.py sale add <開始日> <終了日> <名前>
+                                          お買い物マラソンなどの期間を登録（終了日は最後の丸1日。1:59終了なら前日）
+    py drafts.py sale del <開始日>         登録した期間を消す
     py drafts.py next                     次の投稿枠のリマインダー文を1行で出す
     py drafts.py content                  リンクなし投稿の下書き（content_drafts.json）の一覧とチェック
     py drafts.py link <item_code> <Threads用リンク>
@@ -38,6 +43,20 @@ MAX_POSTS_PER_DAY = 2
 
 # 商品投稿の時間枠（上から順に使う）
 POST_SLOTS = ["12:30", "18:30"]
+
+# 単価の高い商品は、楽天市場のポイントアップの日に寄せる（plan / replan）。
+# クリックから24時間以内にかごに入れないと成果にならないので、「今日買う理由」がある日に出す
+HIGH_PRICE = 5000
+
+# 毎月決まった日（2026-09-27に楽天カード公式・キャンペーン一覧で確認）
+MONTHLY_SALE_DAYS = {
+    1: "ワンダフルデー",
+    18: "ご愛顧感謝デー",
+    **{d: "5と0のつく日" for d in (5, 10, 15, 20, 25, 30)},
+}
+
+# お買い物マラソン・楽天スーパーSALEは毎回日程が違うので、発表されたら `py drafts.py sale add` で登録する
+SALE_PERIODS_FILE = os.path.join(OUTPUT_DIR, "sale_periods.json")
 
 
 def draft_path(item_code: str, used: bool = False) -> str:
@@ -130,6 +149,39 @@ def mark_draft_used(item_code: str):
         return
     os.makedirs(USED_DIR, exist_ok=True)
     os.replace(path, draft_path(item_code, used=True))
+
+
+def load_sale_periods() -> list[dict]:
+    """登録したセール期間（{"name", "start", "end"}、日付は YYYY-MM-DD、end は最後の丸1日）"""
+    if not os.path.exists(SALE_PERIODS_FILE):
+        return []
+    with open(SALE_PERIODS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_sale_periods(periods: list[dict]):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    periods.sort(key=lambda p: p["start"])
+    with open(SALE_PERIODS_FILE, "w", encoding="utf-8") as f:
+        json.dump(periods, f, ensure_ascii=False, indent=2)
+
+
+def sale_name(day: date | str | None, periods: list[dict] | None = None) -> str:
+    """その日がセール・ポイントアップの日なら名前を返す（違えば空文字）"""
+    if not day:
+        return ""
+    if isinstance(day, str):
+        day = date.fromisoformat(day[:10])
+    periods = load_sale_periods() if periods is None else periods
+    key = day.isoformat()
+    for period in periods:
+        if period["start"] <= key <= period["end"]:
+            return period["name"]
+    return MONTHLY_SALE_DAYS.get(day.day, "")
+
+
+def is_high_price(draft: dict) -> bool:
+    return (draft.get("price") or 0) >= HIGH_PRICE
 
 
 def _clean_caption(caption: str, limit: int = 1500) -> str:
@@ -234,7 +286,7 @@ def cmd_check(item_code: str) -> bool:
     return not problems
 
 
-def format_stock_line(draft: dict, today: str | None = None) -> str:
+def format_stock_line(draft: dict, today: str | None = None, periods: list[dict] | None = None) -> str:
     today = today or date.today().isoformat()
     planned = draft.get("planned_date")
     if not is_ready(draft):
@@ -246,8 +298,9 @@ def format_stock_line(draft: dict, today: str | None = None) -> str:
     else:
         mark = "    "
     when = f"{planned} {draft.get('planned_time') or '     '}" if planned else "予定なし        "
+    sale = "★" if sale_name(planned, periods) else " "
     first_line = draft.get("post_text", "").strip().split("。")[0][:24]
-    return (f"[{mark}] {when}  ¥{draft['price']:>6,}  "
+    return (f"[{mark}] {when}{sale} ¥{draft['price']:>6,}  "
             f"{first_line or draft['name'][:24]}  ({draft['item_code']})")
 
 
@@ -268,8 +321,10 @@ def cmd_list():
         return
     print_stock_summary()
     print()
+    periods = load_sale_periods()
     for d in stock:
-        print(format_stock_line(d))
+        print(format_stock_line(d, periods=periods))
+    print(f"\n★＝セール・ポイントアップの日（¥{HIGH_PRICE:,}以上の商品を寄せる。日程は py drafts.py sale）")
 
     unplanned = [d for d in stock if is_ready(d) and not d.get("planned_date")]
     if unplanned:
@@ -279,7 +334,10 @@ def cmd_list():
 def cmd_plan(per_day: int = MAX_POSTS_PER_DAY, reset: bool = False):
     """
     予定のない作成済み下書きに、空いている投稿枠（日付＋時間）を順に割り当てる。
-    reset=True なら、手動で決めた予定（date_fixed）以外をいったん外してから割り当てる。
+    reset=True なら、手動で決めた予定（date_fixed）と予約済み（queued_at）以外をいったん外してから割り当てる。
+
+    単価の高い商品（HIGH_PRICE以上）はセール・ポイントアップの日の枠に、高い順に入れる。
+    普通の日は安い商品を作成順に入れ、安い商品がなくなったら、残った高い商品を安い順に入れる（空き日を作らない）。
     """
     if not 1 <= per_day <= MAX_POSTS_PER_DAY:
         print(f"1日の件数は1〜{MAX_POSTS_PER_DAY}で指定してください")
@@ -288,7 +346,8 @@ def cmd_plan(per_day: int = MAX_POSTS_PER_DAY, reset: bool = False):
     stock = load_stock()
     if reset:
         for draft in stock:
-            if draft.get("planned_date") and not draft.get("date_fixed"):
+            # 予約済みを外すと、GitHubのキューと下書きの予定がずれる
+            if draft.get("planned_date") and not draft.get("date_fixed") and not draft.get("queued_at"):
                 draft.pop("planned_date")
                 draft.pop("planned_time", None)
                 save_draft(draft)
@@ -313,20 +372,81 @@ def cmd_plan(per_day: int = MAX_POSTS_PER_DAY, reset: bool = False):
             return slot
         return None
 
+    pending = [d for d in stock if is_ready(d) and not d.get("planned_date")]
+    high = sorted((d for d in pending if is_high_price(d)), key=lambda d: -(d.get("price") or 0))
+    normal = [d for d in pending if not is_high_price(d)]
+    periods = load_sale_periods()
+
     day = now.date()
-    for draft in stock:
-        if not is_ready(draft) or draft.get("planned_date"):
-            continue
-        while (slot := free_slot(day)) is None:
+    while high or normal:
+        slot = free_slot(day)
+        if slot is None:
             day += timedelta(days=1)
+            continue
+        sale = sale_name(day, periods)
+        if sale and high:
+            draft = high.pop(0)   # セールの日：残っているうちでいちばん高い商品
+        elif normal:
+            draft = normal.pop(0)
+        else:
+            draft = high.pop()    # 安い商品が尽きた普通の日：残っているうちでいちばん安い商品
         draft["planned_date"] = day.isoformat()
         draft["planned_time"] = slot
         booked[day.isoformat()].append(slot)
         save_draft(draft)
-        print(f"{day.isoformat()} {slot}  {draft['name'][:40]}")
+        label = f"★{sale}" if sale else ""
+        print(f"{day.isoformat()} {slot}  ¥{draft['price']:>6,}  {short_name(draft, 20)}  {label}")
 
     print()
     cmd_list()
+
+
+def cmd_sale(args: list[str]):
+    """セール期間の一覧・登録・削除"""
+    periods = load_sale_periods()
+    action = args[0] if args else "list"
+
+    if action == "add" and len(args) >= 4:
+        try:
+            start = date.fromisoformat(args[1]).isoformat()
+            end = date.fromisoformat(args[2]).isoformat()
+        except ValueError:
+            print("日付は YYYY-MM-DD で指定してください")
+            return
+        if end < start:
+            print("終了日が開始日より前です")
+            return
+        name = " ".join(args[3:])
+        periods = [p for p in periods if p["start"] != start]
+        periods.append({"name": name, "start": start, "end": end})
+        save_sale_periods(periods)
+        print(f"✅ 登録しました: {start}〜{end} {name}")
+        print("   → 予定に反映するなら py drafts.py replan")
+    elif action == "del" and len(args) >= 2:
+        kept = [p for p in periods if p["start"] != args[1]]
+        if len(kept) == len(periods):
+            print(f"⚠️ {args[1]} に始まる期間は登録されていません")
+            return
+        save_sale_periods(kept)
+        print(f"✅ 削除しました: {args[1]}〜")
+        print("   → 予定に反映するなら py drafts.py replan")
+    elif action != "list":
+        print("py drafts.py sale add <開始日> <終了日> <名前> ／ sale del <開始日> ／ sale")
+        return
+
+    today = date.today()
+    upcoming = [p for p in load_sale_periods() if p["end"] >= today.isoformat()]
+    print("\n登録したセール期間（お買い物マラソン・スーパーSALEなど）:")
+    for p in upcoming:
+        print(f"  {p['start']}〜{p['end']}  {p['name']}")
+    if not upcoming:
+        print("  （なし。日程が発表されたら py drafts.py sale add <開始日> <終了日> <名前>）")
+    print(f"\nこれから30日のセール・ポイントアップの日（¥{HIGH_PRICE:,}以上の商品を寄せる）:")
+    periods = load_sale_periods()
+    for offset in range(30):
+        day = today + timedelta(days=offset)
+        if name := sale_name(day, periods):
+            print(f"  {day.isoformat()}（{'月火水木金土日'[day.weekday()]}） {name}")
 
 
 def short_name(draft: dict, limit: int = 24) -> str:
@@ -501,6 +621,9 @@ def main():
             sys.exit(2)
     elif command == "date" and len(args) >= 3:
         cmd_date(args[1], args[2], args[3] if len(args) > 3 else None)
+    elif command == "sale":
+        cmd_sale(args[1:])
+        return
     else:
         print(__doc__)
         sys.exit(1)

@@ -18,7 +18,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from config import _BASE_DIR
-from drafts import USED_DIR, _live_posts, is_ready, load_stock, post_url
+from drafts import HIGH_PRICE, USED_DIR, _live_posts, is_ready, load_sale_periods, load_stock, post_url, sale_name
 
 # Gitの管理外（files/ の1つ上）に置き、エクスプローラーから開きやすくする
 SHEET_PATH = os.path.join(os.path.dirname(_BASE_DIR), "投稿管理表.xlsx")
@@ -44,6 +44,7 @@ COLUMNS = [
     ("ステータス", 12),
     ("投稿予定日", 12),
     ("投稿時間", 9),
+    ("セールの日", 16),
     ("投稿日", 12),
     ("投稿済み", 9),
     ("紹介文", 8),
@@ -90,6 +91,7 @@ def build_rows() -> list[dict]:
     """商品ごとに1行。投稿ログ・使用済み下書き・ストックを item_code でまとめる"""
     rows = {}
     used = _load_used_drafts()
+    periods = load_sale_periods()
 
     for post in _live_posts():
         code = post.get("item_code")
@@ -130,6 +132,7 @@ def build_rows() -> list[dict]:
             "ステータス": status,
             "投稿予定日": None if posted else _to_date(draft.get("planned_date")),
             "投稿時間": row.get("posted_at", "")[11:16] if posted else (draft.get("planned_time") or ""),
+            "セールの日": sale_name(row.get("posted_at") if posted else draft.get("planned_date"), periods),
             "投稿日": _to_date(row.get("posted_at")),
             "投稿済み": "済" if row["post_count"] else "未",
             "紹介文": "済" if draft.get("post_text", "").strip() else "未",
@@ -234,6 +237,8 @@ def _add_guide_sheet(wb: Workbook, rows: list[dict]):
         ("  このファイルは自動で作り直されます", "Excel上で書き換えても元データには反映されません"),
         ("  Threadsリンク", "済＝SNSボタンで作ったThreads用リンクを返信に使う（SNS別レポートに載る）。未＝APIの通常リンク"),
         ("  投稿時間","商品投稿は 12:30 と 18:30 の1日2枠（投稿済みの行は実際に投稿した時刻）"),
+        ("  セールの日", f"5と0のつく日・ワンダフルデー（1日）・ご愛顧感謝デー（18日）と、登録したマラソン等。"
+                        f"¥{HIGH_PRICE:,}以上の商品はこの日に寄せる（py drafts.py sale）"),
         ("  予定日の変更", "Claude Codeに依頼するか、py drafts.py date <商品コード> <YYYY-MM-DD> [HH:MM]"),
         ("  更新されないとき", "Excelを閉じてから py sheet.py を実行"),
     ]
