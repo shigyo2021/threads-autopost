@@ -7,6 +7,7 @@
     py drafts.py plan [1日の件数]          予定のない下書きに、空いている投稿枠を順番に割り当てる（既定: 1日2件）。
                                           ¥5,000以上の商品はセール・ポイントアップの日に寄せる
     py drafts.py replan [1日の件数]        手動で決めた予定と予約済み以外をいったん外して、割り当て直す
+                                          （手動で決めた予定でも、日付が過ぎたものは組み直す）
     py drafts.py sale                     セール期間と、これから30日のセールの日を一覧
     py drafts.py sale add <開始日> <終了日> <名前>
                                           お買い物マラソンなどの期間を登録（終了日は最後の丸1日。1:59終了なら前日）
@@ -335,6 +336,7 @@ def cmd_plan(per_day: int = MAX_POSTS_PER_DAY, reset: bool = False):
     """
     予定のない作成済み下書きに、空いている投稿枠（日付＋時間）を順に割り当てる。
     reset=True なら、手動で決めた予定（date_fixed）と予約済み（queued_at）以外をいったん外してから割り当てる。
+    手動で決めた予定でも、日付が過ぎたものは外す。
 
     単価の高い商品（HIGH_PRICE以上）はセール・ポイントアップの日の枠に、高い順に入れる。
     普通の日は安い商品を作成順に入れ、安い商品がなくなったら、残った高い商品を安い順に入れる（空き日を作らない）。
@@ -345,12 +347,18 @@ def cmd_plan(per_day: int = MAX_POSTS_PER_DAY, reset: bool = False):
 
     stock = load_stock()
     if reset:
+        today_key = datetime.now().date().isoformat()
         for draft in stock:
             # 予約済みを外すと、GitHubのキューと下書きの予定がずれる
-            if draft.get("planned_date") and not draft.get("date_fixed") and not draft.get("queued_at"):
-                draft.pop("planned_date")
-                draft.pop("planned_time", None)
-                save_draft(draft)
+            if not draft.get("planned_date") or draft.get("queued_at"):
+                continue
+            # 手動で決めた予定は動かさない。ただし日付が過ぎたもの（投稿できなかった）は外して組み直す
+            if draft.get("date_fixed") and draft["planned_date"] >= today_key:
+                continue
+            draft.pop("planned_date")
+            draft.pop("planned_time", None)
+            draft.pop("date_fixed", None)
+            save_draft(draft)
 
     booked = defaultdict(list)  # 日付 → 予約済みの時間（時間なしの予定も1件と数える）
     for draft in stock:
