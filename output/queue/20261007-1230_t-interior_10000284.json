@@ -30,6 +30,10 @@
   "quality_score": 7,
   "text_source": "claude_code",
   "scheduled_at": "2026-10-07T12:30:00",
-  "status": "pending",
-  "created_at": "2026-10-06T22:18:01"
+  "status": "posted",
+  "created_at": "2026-10-06T22:18:01",
+  "post_id": "17953870323037060",
+  "posted_at": "2026-10-07T15:20:39",
+  "image_count": 17,
+  "reply_id": "17873907147636086"
 }
