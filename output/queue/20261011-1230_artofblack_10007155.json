@@ -25,5 +25,10 @@
   "text_source": "claude_code",
   "scheduled_at": "2026-10-11T12:30:00",
   "status": "pending",
-  "created_at": "2026-10-10T23:01:27"
+  "created_at": "2026-10-10T23:01:27",
+  "post_id": "18413725117093290",
+  "posted_at": "2026-10-11T13:28:26",
+  "image_count": 11,
+  "retry_count": 1,
+  "last_error": "HTTP 400: The requested resource does not exist (code=24, subcode=4279009)"
 }
